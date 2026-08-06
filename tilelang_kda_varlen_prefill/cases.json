@@ -1,0 +1,141 @@
+{
+  "basic": [
+    {
+      "name": "basic_single_token",
+      "heads": 8,
+      "lengths": [1],
+      "seed": 101,
+      "weight": 1.0
+    },
+    {
+      "name": "basic_chunk_boundaries",
+      "heads": 8,
+      "lengths": [1, 63, 64, 65],
+      "seed": 102,
+      "weight": 1.0
+    },
+    {
+      "name": "basic_variable_length_h16",
+      "heads": 16,
+      "lengths": [7, 33],
+      "seed": 103,
+      "weight": 1.0
+    }
+  ],
+  "correctness": [
+    {
+      "name": "correctness_chunk_boundaries",
+      "heads": 8,
+      "lengths": [1, 63, 64, 65, 127, 128, 129],
+      "seed": 301,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_variable_lengths_h16",
+      "heads": 16,
+      "lengths": [73, 256, 511],
+      "seed": 302,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_gate_saturation",
+      "heads": 8,
+      "lengths": [64, 129],
+      "profile": {
+        "g_mean": 4.0,
+        "g_scale": 3.0,
+        "dt_bias_scale": 1.0,
+        "beta_scale": 2.0,
+        "initial_state_scale": 0.05
+      },
+      "seed": 303,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_negative_gate",
+      "heads": 8,
+      "lengths": [96, 160],
+      "profile": {
+        "g_mean": -4.0,
+        "g_scale": 3.0,
+        "dt_bias_scale": 1.0,
+        "beta_scale": 2.0,
+        "initial_state_scale": 0.05
+      },
+      "seed": 304,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_near_zero_qk",
+      "heads": 8,
+      "lengths": [65, 127],
+      "profile": {
+        "q_scale": 0.0001,
+        "k_scale": 0.0001,
+        "v_scale": 1.0,
+        "beta_scale": 4.0,
+        "initial_state_scale": 0.05
+      },
+      "seed": 305,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_long_sequences",
+      "heads": 8,
+      "lengths": [1024, 511, 257, 33],
+      "seed": 306,
+      "weight": 1.0
+    }
+  ],
+  "performance": [
+    {
+      "name": "performance_balanced",
+      "heads": 8,
+      "lengths": [128, 128, 64, 64],
+      "seed": 201,
+      "weight": 0.5
+    },
+    {
+      "name": "performance_mixed_lengths",
+      "heads": 8,
+      "lengths": [1024, 256, 64, 31],
+      "seed": 202,
+      "weight": 0.5
+    }
+  ],
+  "official": [
+    {
+      "name": "K1_balanced_short",
+      "heads": 16,
+      "lengths": [
+        128, 128, 128, 128, 128, 128, 128, 128,
+        128, 128, 128, 128, 128, 128, 128, 128,
+        128, 128, 128, 128, 128, 128, 128, 128,
+        128, 128, 128, 128, 128, 128, 128, 128
+      ],
+      "seed": 1001,
+      "weight": 0.2
+    },
+    {
+      "name": "K2_variable_lengths",
+      "heads": 16,
+      "lengths": [64, 128, 256, 512, 768, 1024, 2048, 3264],
+      "seed": 1002,
+      "weight": 0.25
+    },
+    {
+      "name": "K3_single_16k",
+      "heads": 8,
+      "lengths": [16384],
+      "seed": 1003,
+      "weight": 0.25
+    },
+    {
+      "name": "K4_one_long_three_short",
+      "heads": 8,
+      "lengths": [24576, 4096, 2048, 2048],
+      "seed": 1004,
+      "weight": 0.3
+    }
+  ]
+}

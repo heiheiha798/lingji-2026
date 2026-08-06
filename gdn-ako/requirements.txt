@@ -1,0 +1,6 @@
+# 实测可跑组合（单张 RTX 4090）。版本敏感：太新的 torch/triton 过不了 fla 的 JIT，
+# 且需 Python 3.11（fla 0.5.1 在 3.10 下 import 即失败）。详见 INSTALL.md。
+torch==2.6.0
+triton==3.2.0
+flash-linear-attention==0.5.1   # 提供 fla.ops.gated_delta_rule（chunk_ / fused_recurrent_）
+numpy==2.1.3
