@@ -163,9 +163,6 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                     k_norm[row] = T.rsqrt(k_norm[row])
                 T.sync_threads()
 
-                for row, dim in T.Parallel(_CHUNK_SIZE, _HEAD_DIM):
-                    q_shared[row, dim] *= q_norm[row]
-                    k_shared[row, dim] *= k_norm[row]
                 T.clear(aqk_shared)
                 T.clear(ainv_shared)
 
@@ -184,6 +181,7 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                                 left_q[row, dim] = T.if_then_else(
                                     row_index < valid_tokens,
                                     q_shared[row_index, dim_index]
+                                    * q_norm[row_index]
                                     * T.exp2(
                                         g_shared[row_index, dim_index]
                                         - gate_reference
@@ -194,6 +192,7 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                                 left_k[row, dim] = T.if_then_else(
                                     row_index < valid_tokens,
                                     k_shared[row_index, dim_index]
+                                    * k_norm[row_index]
                                     * beta[row_index]
                                     * T.exp2(
                                         g_shared[row_index, dim_index]
@@ -204,6 +203,7 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                                 right_k[row, dim] = T.if_then_else(
                                     column_index < valid_tokens,
                                     k_shared[column_index, dim_index]
+                                    * k_norm[column_index]
                                     * T.exp2(
                                         gate_reference
                                         - g_shared[column_index, dim_index]
@@ -333,34 +333,34 @@ def _compile_persistent_recurrence(
         ) as (value_block, head, sequence):
             thread = T.get_thread_binding(0)
             k_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _HEAD_DIM), T.bfloat16
+                (_CHUNK_SIZE, _HEAD_DIM), T.float16
             )
             x_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _HEAD_DIM), T.bfloat16
+                (_CHUNK_SIZE, _HEAD_DIM), T.float16
             )
             g_shared = T.alloc_shared(
                 (_CHUNK_SIZE, _HEAD_DIM), T.float32
             )
             ainv_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _CHUNK_SIZE), T.bfloat16
+                (_CHUNK_SIZE, _CHUNK_SIZE), T.float16
             )
             aqk_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _CHUNK_SIZE), T.bfloat16
+                (_CHUNK_SIZE, _CHUNK_SIZE), T.float16
             )
             state_shared = T.alloc_shared(
-                (_HEAD_DIM, _VALUE_TILE), T.bfloat16
+                (_HEAD_DIM, _VALUE_TILE), T.float16
             )
             rhs_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _VALUE_TILE), T.bfloat16
+                (_CHUNK_SIZE, _VALUE_TILE), T.float16
             )
             value_new_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _VALUE_TILE), T.bfloat16
+                (_CHUNK_SIZE, _VALUE_TILE), T.float16
             )
             out_shared = T.alloc_shared(
                 (_CHUNK_SIZE, _VALUE_TILE), T.bfloat16
             )
             norm = T.alloc_shared((_CHUNK_SIZE,), T.float32)
-            beta = T.alloc_shared((_CHUNK_SIZE,), T.bfloat16)
+            beta = T.alloc_shared((_CHUNK_SIZE,), T.float16)
 
             state_fragment = T.alloc_fragment(
                 (_HEAD_DIM, _VALUE_TILE), T.float32
