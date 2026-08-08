@@ -333,34 +333,34 @@ def _compile_persistent_recurrence(
         ) as (value_block, head, sequence):
             thread = T.get_thread_binding(0)
             k_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _HEAD_DIM), T.float16
+                (_CHUNK_SIZE, _HEAD_DIM), T.bfloat16
             )
             x_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _HEAD_DIM), T.float16
+                (_CHUNK_SIZE, _HEAD_DIM), T.bfloat16
             )
             g_shared = T.alloc_shared(
                 (_CHUNK_SIZE, _HEAD_DIM), T.float32
             )
             ainv_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _CHUNK_SIZE), T.float16
+                (_CHUNK_SIZE, _CHUNK_SIZE), T.bfloat16
             )
             aqk_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _CHUNK_SIZE), T.float16
+                (_CHUNK_SIZE, _CHUNK_SIZE), T.bfloat16
             )
             state_shared = T.alloc_shared(
-                (_HEAD_DIM, _VALUE_TILE), T.float16
+                (_HEAD_DIM, _VALUE_TILE), T.bfloat16
             )
             rhs_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _VALUE_TILE), T.float16
+                (_CHUNK_SIZE, _VALUE_TILE), T.bfloat16
             )
             value_new_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _VALUE_TILE), T.float16
+                (_CHUNK_SIZE, _VALUE_TILE), T.bfloat16
             )
             out_shared = T.alloc_shared(
                 (_CHUNK_SIZE, _VALUE_TILE), T.bfloat16
             )
             norm = T.alloc_shared((_CHUNK_SIZE,), T.float32)
-            beta = T.alloc_shared((_CHUNK_SIZE,), T.float16)
+            beta = T.alloc_shared((_CHUNK_SIZE,), T.bfloat16)
 
             state_fragment = T.alloc_fragment(
                 (_HEAD_DIM, _VALUE_TILE), T.float32
