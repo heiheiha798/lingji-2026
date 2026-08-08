@@ -7,7 +7,7 @@ import torch
 
 _CHUNK_SIZE = 64
 _HEAD_DIM = 128
-_VALUE_TILE = 16
+_VALUE_TILE = 32
 _OPERATOR_THREADS = 32
 _THREADS = 128
 _INV_SQRT_HEAD_DIM = 0.08838834764831845
@@ -356,9 +356,6 @@ def _compile_persistent_recurrence(
             value_new_shared = T.alloc_shared(
                 (_CHUNK_SIZE, _VALUE_TILE), T.bfloat16
             )
-            out_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _VALUE_TILE), T.bfloat16
-            )
             norm = T.alloc_shared((_CHUNK_SIZE,), T.float32)
             beta = T.alloc_shared((_CHUNK_SIZE,), T.bfloat16)
 
@@ -557,7 +554,7 @@ def _compile_persistent_recurrence(
                         value_new_shared,
                         out_fragment,
                     )
-                    T.copy(out_fragment, out_shared)
+                    T.copy(out_fragment, rhs_shared)
                     for row, value in T.Parallel(
                         _CHUNK_SIZE, _VALUE_TILE
                     ):
@@ -566,7 +563,7 @@ def _compile_persistent_recurrence(
                                 chunk_start + row,
                                 head,
                                 value_block * _VALUE_TILE + value,
-                            ] = out_shared[row, value]
+                            ] = rhs_shared[row, value]
 
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
