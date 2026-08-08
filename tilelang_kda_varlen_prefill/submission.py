@@ -365,9 +365,6 @@ def _compile_persistent_recurrence(
             rhs_shared = T.alloc_shared(
                 (_CHUNK_SIZE, value_tile), T.bfloat16
             )
-            value_new_shared = T.alloc_shared(
-                (_CHUNK_SIZE, value_tile), T.bfloat16
-            )
             norm = T.alloc_shared((_CHUNK_SIZE,), T.float32)
             beta = T.alloc_shared((_CHUNK_SIZE,), T.bfloat16)
 
@@ -509,7 +506,7 @@ def _compile_persistent_recurrence(
                         value_new_fragment,
                         clear_accum=True,
                     )
-                    T.copy(value_new_fragment, value_new_shared)
+                    T.copy(value_new_fragment, rhs_shared)
 
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
@@ -546,19 +543,9 @@ def _compile_persistent_recurrence(
                     )
                     T.gemm(
                         aqk_shared,
-                        value_new_shared,
+                        rhs_shared,
                         out_fragment,
                     )
-                    T.copy(out_fragment, rhs_shared)
-                    for row, value in T.Parallel(
-                        _CHUNK_SIZE, value_tile
-                    ):
-                        if row < valid_tokens:
-                            Out[
-                                chunk_start + row,
-                                head,
-                                value_block * value_tile + value,
-                            ] = rhs_shared[row, value]
 
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
@@ -581,10 +568,20 @@ def _compile_persistent_recurrence(
                     T.sync_threads()
                     T.gemm(
                         x_shared,
-                        value_new_shared,
+                        rhs_shared,
                         state_fragment,
                         transpose_A=True,
                     )
+                    T.copy(out_fragment, rhs_shared)
+                    for row, value in T.Parallel(
+                        _CHUNK_SIZE, value_tile
+                    ):
+                        if row < valid_tokens:
+                            Out[
+                                chunk_start + row,
+                                head,
+                                value_block * value_tile + value,
+                            ] = rhs_shared[row, value]
 
             T.copy(state_fragment, state_shared)
             T.copy(
