@@ -7,7 +7,6 @@ import torch
 
 _CHUNK_SIZE = 64
 _HEAD_DIM = 128
-_VALUE_TILE = 32
 _OPERATOR_THREADS = 32
 _THREADS = 128
 _INV_SQRT_HEAD_DIM = 0.08838834764831845
@@ -290,7 +289,10 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
     pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
 )
 def _compile_persistent_recurrence(
-    total_tokens: int, num_sequences: int, num_heads: int
+    total_tokens: int,
+    num_sequences: int,
+    num_heads: int,
+    value_tile: int,
 ):
     max_chunks_per_sequence = (
         total_tokens + _CHUNK_SIZE - 1
@@ -326,7 +328,7 @@ def _compile_persistent_recurrence(
         FinalState: T.Tensor(state_shape, T.bfloat16),
     ):
         with T.Kernel(
-            T.ceildiv(_HEAD_DIM, _VALUE_TILE),
+            T.ceildiv(_HEAD_DIM, value_tile),
             num_heads,
             num_sequences,
             threads=_THREADS,
@@ -348,28 +350,28 @@ def _compile_persistent_recurrence(
                 (_CHUNK_SIZE, _CHUNK_SIZE), T.bfloat16
             )
             state_shared = T.alloc_shared(
-                (_HEAD_DIM, _VALUE_TILE), T.bfloat16
+                (_HEAD_DIM, value_tile), T.bfloat16
             )
             rhs_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _VALUE_TILE), T.bfloat16
+                (_CHUNK_SIZE, value_tile), T.bfloat16
             )
             value_new_shared = T.alloc_shared(
-                (_CHUNK_SIZE, _VALUE_TILE), T.bfloat16
+                (_CHUNK_SIZE, value_tile), T.bfloat16
             )
             norm = T.alloc_shared((_CHUNK_SIZE,), T.float32)
             beta = T.alloc_shared((_CHUNK_SIZE,), T.bfloat16)
 
             state_fragment = T.alloc_fragment(
-                (_HEAD_DIM, _VALUE_TILE), T.float32
+                (_HEAD_DIM, value_tile), T.float32
             )
             rhs_fragment = T.alloc_fragment(
-                (_CHUNK_SIZE, _VALUE_TILE), T.float32
+                (_CHUNK_SIZE, value_tile), T.float32
             )
             value_new_fragment = T.alloc_fragment(
-                (_CHUNK_SIZE, _VALUE_TILE), T.float32
+                (_CHUNK_SIZE, value_tile), T.float32
             )
             out_fragment = T.alloc_fragment(
-                (_CHUNK_SIZE, _VALUE_TILE), T.float32
+                (_CHUNK_SIZE, value_tile), T.float32
             )
             a_scale = T.alloc_local((1,), T.float32)
             dt_bias = T.alloc_local((4,), T.float32)
@@ -380,8 +382,8 @@ def _compile_persistent_recurrence(
                     head,
                     0:_HEAD_DIM,
                     value_block
-                    * _VALUE_TILE : (value_block + 1)
-                    * _VALUE_TILE,
+                    * value_tile : (value_block + 1)
+                    * value_tile,
                 ],
                 state_shared,
             )
@@ -489,7 +491,7 @@ def _compile_persistent_recurrence(
                         clear_accum=True,
                     )
                     for row, value in T.Parallel(
-                        _CHUNK_SIZE, _VALUE_TILE
+                        _CHUNK_SIZE, value_tile
                     ):
                         rhs_fragment[row, value] = T.if_then_else(
                             row < valid_tokens,
@@ -498,7 +500,7 @@ def _compile_persistent_recurrence(
                                 V[
                                     chunk_start + row,
                                     head,
-                                    value_block * _VALUE_TILE + value,
+                                    value_block * value_tile + value,
                                 ]
                                 - rhs_fragment[row, value]
                             ),
@@ -556,13 +558,13 @@ def _compile_persistent_recurrence(
                     )
                     T.copy(out_fragment, rhs_shared)
                     for row, value in T.Parallel(
-                        _CHUNK_SIZE, _VALUE_TILE
+                        _CHUNK_SIZE, value_tile
                     ):
                         if row < valid_tokens:
                             Out[
                                 chunk_start + row,
                                 head,
-                                value_block * _VALUE_TILE + value,
+                                value_block * value_tile + value,
                             ] = rhs_shared[row, value]
 
                     for row, dim in T.Parallel(
@@ -578,7 +580,7 @@ def _compile_persistent_recurrence(
                             0.0,
                         )
                     for dim, value in T.Parallel(
-                        _HEAD_DIM, _VALUE_TILE
+                        _HEAD_DIM, value_tile
                     ):
                         state_fragment[dim, value] *= T.exp2(
                             g_shared[valid_tokens - 1, dim]
@@ -599,8 +601,8 @@ def _compile_persistent_recurrence(
                     head,
                     0:_HEAD_DIM,
                     value_block
-                    * _VALUE_TILE : (value_block + 1)
-                    * _VALUE_TILE,
+                    * value_tile : (value_block + 1)
+                    * value_tile,
                 ],
             )
 
@@ -618,7 +620,10 @@ class Submission:
             total_tokens, num_sequences, num_heads
         )
         persistent_recurrence = _compile_persistent_recurrence(
-            total_tokens, num_sequences, num_heads
+            total_tokens,
+            num_sequences,
+            num_heads,
+            16 if num_sequences * num_heads < 32 else 32,
         )
         return chunk_operators, persistent_recurrence, operator_elements
 
