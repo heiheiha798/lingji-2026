@@ -457,6 +457,9 @@ def _compile_persistent_recurrence(
                         _CHUNK_SIZE, _HEAD_DIM
                     ):
                         k_shared[row, dim] *= norm[row]
+                        x_shared[row, dim] = k_shared[
+                            row, dim
+                        ] * T.exp2(g_shared[row, dim])
                     for row, column in T.Parallel(
                         _CHUNK_SIZE, _CHUNK_SIZE
                     ):
@@ -471,17 +474,6 @@ def _compile_persistent_recurrence(
                             0.0,
                         )
                     T.copy(state_fragment, state_shared)
-                    T.sync_threads()
-
-                    for row, dim in T.Parallel(
-                        _CHUNK_SIZE, _HEAD_DIM
-                    ):
-                        x_shared[row, dim] = T.if_then_else(
-                            row < valid_tokens,
-                            k_shared[row, dim]
-                            * T.exp2(g_shared[row, dim]),
-                            0.0,
-                        )
                     T.sync_threads()
                     T.gemm(
                         x_shared,
