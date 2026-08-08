@@ -85,6 +85,7 @@ def main() -> None:
         ("SASS inst", "instructions"),
         ("HMMA", "hmma"),
         ("MUFU", "mufu"),
+        ("LDG", "global_load"),
         ("Cubin bytes", "cubin_bytes"),
     )
     lines = [

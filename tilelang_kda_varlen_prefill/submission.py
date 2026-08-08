@@ -45,6 +45,7 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
         with T.Kernel(
             max_chunks, num_heads, threads=_OPERATOR_THREADS
         ) as (chunk_id, head):
+            thread = T.get_thread_binding(0)
             sequence_id = T.alloc_local((1,), T.int32)
             chunk_in_sequence = T.alloc_local((1,), T.int32)
             chunk_prefix = T.alloc_local((1,), T.int32)
@@ -99,11 +100,14 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                 aqk_fragment = T.alloc_fragment((16, 16), T.float32)
                 akk_fragment = T.alloc_fragment((16, 16), T.float32)
                 a_scale = T.alloc_local((1,), T.float32)
+                dt_bias = T.alloc_local((4,), T.float32)
                 coefficient_row = T.alloc_shared(
                     (_CHUNK_SIZE,), T.float32
                 )
 
                 a_scale[0] = T.exp(ALog[head])
+                for lane in T.serial(4):
+                    dt_bias[lane] = DtBias[head, thread * 4 + lane]
                 for row, dim in T.Parallel(_CHUNK_SIZE, _HEAD_DIM):
                     q_shared[row, dim] = T.if_then_else(
                         row < valid_tokens,
@@ -122,7 +126,7 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                             a_scale[0]
                             * (
                                 GRaw[chunk_start + row, head, dim]
-                                + DtBias[head, dim]
+                                + dt_bias[dim % 4]
                             )
                         ),
                         0.0,
@@ -325,6 +329,7 @@ def _compile_persistent_recurrence(
             num_sequences,
             threads=_THREADS,
         ) as (value_block, head, sequence):
+            thread = T.get_thread_binding(0)
             k_shared = T.alloc_shared(
                 (_CHUNK_SIZE, _HEAD_DIM), T.bfloat16
             )
@@ -368,6 +373,7 @@ def _compile_persistent_recurrence(
                 (_CHUNK_SIZE, _VALUE_TILE), T.float32
             )
             a_scale = T.alloc_local((1,), T.float32)
+            dt_bias = T.alloc_local((4,), T.float32)
 
             T.copy(
                 InitialState[
@@ -385,6 +391,10 @@ def _compile_persistent_recurrence(
             sequence_start = CuSeqLens[sequence]
             sequence_length = CuSeqLens[sequence + 1] - sequence_start
             a_scale[0] = T.exp(ALog[head])
+            for lane in T.serial(4):
+                dt_bias[lane] = DtBias[
+                    head, (thread % _OPERATOR_THREADS) * 4 + lane
+                ]
 
             for chunk in T.serial(max_chunks_per_sequence):
                 if chunk * _CHUNK_SIZE < sequence_length:
@@ -409,7 +419,7 @@ def _compile_persistent_recurrence(
                                 a_scale[0]
                                 * (
                                     GRaw[chunk_start + row, head, dim]
-                                    + DtBias[head, dim]
+                                    + dt_bias[dim % 4]
                                 )
                             ),
                             0.0,
