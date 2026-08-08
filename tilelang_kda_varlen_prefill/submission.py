@@ -385,9 +385,8 @@ def _compile_persistent_recurrence(
                     * value_tile : (value_block + 1)
                     * value_tile,
                 ],
-                state_shared,
+                state_fragment,
             )
-            T.copy(state_shared, state_fragment)
 
             sequence_start = CuSeqLens[sequence]
             sequence_length = CuSeqLens[sequence + 1] - sequence_start
