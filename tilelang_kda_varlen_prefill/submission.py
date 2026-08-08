@@ -374,9 +374,6 @@ def _compile_persistent_recurrence(
             rhs_fragment = T.alloc_fragment(
                 (_CHUNK_SIZE, value_tile), T.float32
             )
-            value_new_fragment = T.alloc_fragment(
-                (_CHUNK_SIZE, value_tile), T.float32
-            )
             out_fragment = T.alloc_fragment(
                 (_CHUNK_SIZE, value_tile), T.float32
             )
@@ -503,10 +500,10 @@ def _compile_persistent_recurrence(
                     T.gemm(
                         ainv_shared,
                         rhs_shared,
-                        value_new_fragment,
+                        rhs_fragment,
                         clear_accum=True,
                     )
-                    T.copy(value_new_fragment, rhs_shared)
+                    T.copy(rhs_fragment, rhs_shared)
 
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
