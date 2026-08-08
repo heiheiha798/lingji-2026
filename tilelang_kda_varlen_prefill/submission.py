@@ -28,6 +28,7 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
     dt_bias_shape = (num_heads, _HEAD_DIM)
     cu_shape = (num_sequences + 1,)
     operator_shape = (total_tokens, num_heads, _CHUNK_SIZE)
+    norm_shape = (total_tokens, num_heads, 2)
 
     @T.prim_func
     def kernel(
@@ -40,6 +41,8 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
         CuSeqLens: T.Tensor(cu_shape, T.int32),
         AInv: T.Tensor(operator_shape, T.bfloat16),
         Aqk: T.Tensor(operator_shape, T.bfloat16),
+        Norm: T.Tensor(norm_shape, T.float32),
+        Beta: T.Tensor(beta_shape, T.bfloat16),
     ):
         with T.Kernel(
             max_chunks, num_heads, threads=_OPERATOR_THREADS
@@ -138,6 +141,8 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                         T.sigmoid(BetaRaw[chunk_start + row, head]),
                         0.0,
                     )
+                    if row < valid_tokens:
+                        Beta[chunk_start + row, head] = beta[row]
                 T.sync_threads()
 
                 for dim in T.Parallel(_HEAD_DIM):
@@ -160,6 +165,9 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                         )
                     q_norm[row] = T.rsqrt(q_norm[row])
                     k_norm[row] = T.rsqrt(k_norm[row])
+                    if row < valid_tokens:
+                        Norm[chunk_start + row, head, 0] = q_norm[row]
+                        Norm[chunk_start + row, head, 1] = k_norm[row]
                 T.sync_threads()
 
                 T.clear(aqk_shared)
@@ -310,6 +318,7 @@ def _compile_persistent_recurrence(
     )
     cu_shape = (num_sequences + 1,)
     operator_shape = (total_tokens, num_heads, _CHUNK_SIZE)
+    norm_shape = (total_tokens, num_heads, 2)
 
     @T.prim_func
     def kernel(
@@ -317,13 +326,14 @@ def _compile_persistent_recurrence(
         K: T.Tensor(token_shape, T.bfloat16),
         V: T.Tensor(token_shape, T.bfloat16),
         GRaw: T.Tensor(token_shape, T.bfloat16),
-        BetaRaw: T.Tensor(beta_shape, T.bfloat16),
         ALog: T.Tensor(a_log_shape, T.float32),
         DtBias: T.Tensor(dt_bias_shape, T.float32),
         InitialState: T.Tensor(state_shape, T.bfloat16),
         CuSeqLens: T.Tensor(cu_shape, T.int32),
         AInv: T.Tensor(operator_shape, T.bfloat16),
         Aqk: T.Tensor(operator_shape, T.bfloat16),
+        Norm: T.Tensor(norm_shape, T.float32),
+        Beta: T.Tensor(beta_shape, T.bfloat16),
         Out: T.Tensor(token_shape, T.bfloat16),
         FinalState: T.Tensor(state_shape, T.bfloat16),
     ):
@@ -432,7 +442,12 @@ def _compile_persistent_recurrence(
                     for row in T.Parallel(_CHUNK_SIZE):
                         beta[row] = T.if_then_else(
                             row < valid_tokens,
-                            T.sigmoid(BetaRaw[chunk_start + row, head]),
+                            Beta[chunk_start + row, head],
+                            0.0,
+                        )
+                        norm[row] = T.if_then_else(
+                            row < valid_tokens,
+                            Norm[chunk_start + row, head, 1],
                             0.0,
                         )
                     T.sync_threads()
@@ -441,16 +456,6 @@ def _compile_persistent_recurrence(
                         for row in T.serial(1, _CHUNK_SIZE):
                             if row < valid_tokens:
                                 g_shared[row, dim] += g_shared[row - 1, dim]
-                    T.sync_threads()
-
-                    for row in T.Parallel(_CHUNK_SIZE):
-                        norm[row] = 1.0e-6
-                        for dim in T.serial(_HEAD_DIM):
-                            norm[row] += (
-                                T.cast(k_shared[row, dim], T.float32)
-                                * T.cast(k_shared[row, dim], T.float32)
-                            )
-                        norm[row] = T.rsqrt(norm[row])
                     T.sync_threads()
 
                     for row, dim in T.Parallel(
@@ -514,15 +519,12 @@ def _compile_persistent_recurrence(
                             Q[chunk_start + row, head, dim],
                             0.0,
                         )
-                    T.sync_threads()
                     for row in T.Parallel(_CHUNK_SIZE):
-                        norm[row] = 1.0e-6
-                        for dim in T.serial(_HEAD_DIM):
-                            norm[row] += (
-                                T.cast(x_shared[row, dim], T.float32)
-                                * T.cast(x_shared[row, dim], T.float32)
-                            )
-                        norm[row] = T.rsqrt(norm[row])
+                        norm[row] = T.if_then_else(
+                            row < valid_tokens,
+                            Norm[chunk_start + row, head, 0],
+                            0.0,
+                        )
                     T.sync_threads()
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
@@ -643,6 +645,16 @@ class Submission:
         aqk = workspace_bf16[
             operator_elements : 2 * operator_elements
         ].view(q.shape[0], q.shape[1], _CHUNK_SIZE)
+        token_head_elements = q.shape[0] * q.shape[1]
+        norm_offset = 4 * operator_elements
+        norm = workspace[
+            norm_offset : norm_offset + 8 * token_head_elements
+        ].view(torch.float32).view(q.shape[0], q.shape[1], 2)
+        beta = workspace[
+            norm_offset
+            + 8 * token_head_elements : norm_offset
+            + 10 * token_head_elements
+        ].view(torch.bfloat16).view(q.shape[0], q.shape[1])
 
         chunk_operators(
             q,
@@ -654,19 +666,22 @@ class Submission:
             cu_seqlens,
             ainv,
             aqk,
+            norm,
+            beta,
         )
         persistent_recurrence(
             q,
             k,
             v,
             g_raw,
-            beta_raw,
             a_log,
             dt_bias,
             initial_state,
             cu_seqlens,
             ainv,
             aqk,
+            norm,
+            beta,
             out,
             final_state,
         )
