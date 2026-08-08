@@ -106,8 +106,10 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                 )
 
                 a_scale[0] = T.exp(ALog[head])
-                for lane in T.serial(4):
-                    dt_bias[lane] = DtBias[head, thread * 4 + lane]
+                T.copy(
+                    DtBias[head, thread * 4 : thread * 4 + 4],
+                    dt_bias,
+                )
                 for row, dim in T.Parallel(_CHUNK_SIZE, _HEAD_DIM):
                     q_shared[row, dim] = T.if_then_else(
                         row < valid_tokens,
@@ -391,10 +393,15 @@ def _compile_persistent_recurrence(
             sequence_start = CuSeqLens[sequence]
             sequence_length = CuSeqLens[sequence + 1] - sequence_start
             a_scale[0] = T.exp(ALog[head])
-            for lane in T.serial(4):
-                dt_bias[lane] = DtBias[
-                    head, (thread % _OPERATOR_THREADS) * 4 + lane
-                ]
+            T.copy(
+                DtBias[
+                    head,
+                    (thread % _OPERATOR_THREADS)
+                    * 4 : (thread % _OPERATOR_THREADS) * 4
+                    + 4,
+                ],
+                dt_bias,
+            )
 
             for chunk in T.serial(max_chunks_per_sequence):
                 if chunk * _CHUNK_SIZE < sequence_length:
