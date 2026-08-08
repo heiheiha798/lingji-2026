@@ -496,14 +496,6 @@ def _compile_persistent_recurrence(
                         clear_accum=True,
                     )
                     T.copy(rhs_fragment, rhs_shared)
-                    for row, column in T.Parallel(
-                        _CHUNK_SIZE, _CHUNK_SIZE
-                    ):
-                        operator_shared[row, column] = T.if_then_else(
-                            row < valid_tokens,
-                            Aqk[chunk_start + row, head, column],
-                            0.0,
-                        )
 
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
@@ -529,6 +521,14 @@ def _compile_persistent_recurrence(
                             * norm[row]
                             * T.exp2(g_shared[row, dim])
                             * _INV_SQRT_HEAD_DIM,
+                            0.0,
+                        )
+                    for row, column in T.Parallel(
+                        _CHUNK_SIZE, _CHUNK_SIZE
+                    ):
+                        operator_shared[row, column] = T.if_then_else(
+                            row < valid_tokens,
+                            Aqk[chunk_start + row, head, column],
                             0.0,
                         )
                     T.sync_threads()
