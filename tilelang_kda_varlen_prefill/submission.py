@@ -1993,13 +1993,22 @@ class Submission:
             + 3 * _CHUNK_SIZE * _HEAD_DIM * 2
             + _HEAD_DIM * 4
         )
-        segment_chunks = min(
+        segment_capacity = min(
             max_chunks,
             (int(spec.workspace_bytes) - scratch_offset)
             // tail_chunk_bytes,
         )
-        if segment_chunks <= 0:
+        if segment_capacity <= 0:
             raise ValueError("workspace cannot hold one transformed chunk")
+        if num_sequences > 8:
+            segment_chunks = segment_capacity
+        else:
+            segment_rounds = (
+                max_chunks + segment_capacity - 1
+            ) // segment_capacity
+            segment_chunks = (
+                max_chunks + segment_rounds - 1
+            ) // segment_rounds
 
         chunk_diagonal = _compile_chunk_diagonal(
             total_tokens, num_sequences, num_heads

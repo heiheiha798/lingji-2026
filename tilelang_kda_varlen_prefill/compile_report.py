@@ -117,11 +117,25 @@ def main() -> None:
         tail_chunk_bytes = num_heads * (
             128 * 128 * 2 + 3 * 64 * 128 * 2 + 128 * 4
         )
-        segment_chunks = min(
+        segment_capacity = min(
             max_chunks,
             (spec.workspace_bytes - scratch_offset)
             // tail_chunk_bytes,
         )
+        if segment_capacity <= 0:
+            raise ValueError("workspace cannot hold one transformed chunk")
+        if num_sequences > 8:
+            segment_chunks = segment_capacity
+            segment_rounds = (
+                max_chunks + segment_chunks - 1
+            ) // segment_chunks
+        else:
+            segment_rounds = (
+                max_chunks + segment_capacity - 1
+            ) // segment_capacity
+            segment_chunks = (
+                max_chunks + segment_rounds - 1
+            ) // segment_rounds
         print(
             f"{case_name}: build T={total_tokens}, B={num_sequences}, "
             f"H={num_heads}, segment_chunks={segment_chunks}",
@@ -172,7 +186,7 @@ def main() -> None:
             "num_heads": num_heads,
             "max_chunks": max_chunks,
             "segment_chunks": segment_chunks,
-            "segments": (max_chunks + segment_chunks - 1) // segment_chunks,
+            "segments": segment_rounds,
             "scratch_offset_bytes": scratch_offset,
             "build_seconds": round(build_seconds, 3),
         }
