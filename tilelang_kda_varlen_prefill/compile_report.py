@@ -151,7 +151,7 @@ def main() -> None:
                 num_heads,
                 (
                     64
-                    if num_sequences * num_heads >= 64
+                    if num_sequences * num_heads >= 64 and num_sequences > 8
                     else (8 if num_sequences * num_heads <= 32 else 32)
                 ),
                 segment_chunks,
