@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import gc
 import json
 import math
+import multiprocessing
+import os
 import platform
 import random
 import secrets
@@ -52,6 +55,26 @@ class OpSpec:
             raise ValueError("workspace_bytes must be 128 MiB")
         if self.dtype != torch.bfloat16:
             raise ValueError("dtype must be torch.bfloat16")
+
+
+def _precompile_spec(spec_key: tuple[int, int, int]) -> dict[str, Any]:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    started = time.perf_counter()
+    spec = OpSpec(
+        total_tokens=spec_key[0],
+        num_sequences=spec_key[1],
+        num_heads=spec_key[2],
+    )
+    state = _load_submission().build(spec)
+    return {
+        "total_tokens": spec.total_tokens,
+        "num_sequences": spec.num_sequences,
+        "num_heads": spec.num_heads,
+        "seconds": time.perf_counter() - started,
+        "cache_keys": [
+            getattr(kernel, "_tilelang_cache_key", None) for kernel in state[:2]
+        ],
+    }
 
 
 @dataclass(frozen=True)
@@ -690,10 +713,18 @@ def main() -> None:
     )
     parser.add_argument("--random-seed", type=int)
     parser.add_argument("--random-count", type=int, default=5)
+    parser.add_argument(
+        "--compile-workers",
+        type=int,
+        default=1,
+        help="并行预编译不同静态 shape，再串行运行测试",
+    )
     args = parser.parse_args()
 
     if args.random_count <= 0:
         parser.error("--random-count must be positive")
+    if args.compile_workers <= 0:
+        parser.error("--compile-workers must be positive")
     if args.random_correctness and args.mode != "test":
         parser.error("random correctness cases do not support performance timing")
 
@@ -716,6 +747,55 @@ def main() -> None:
         cases = json.loads(
             Path(__file__).with_name("cases.json").read_text(encoding="utf-8")
         )[case_group]
+
+    precompile: dict[str, Any] | None = None
+    if args.compile_workers > 1:
+        spec_keys = list(
+            dict.fromkeys(
+                (
+                    sum(int(length) for length in case["lengths"]),
+                    len(case["lengths"]),
+                    int(case["heads"]),
+                )
+                for case in cases
+            )
+        )
+        worker_count = min(args.compile_workers, len(spec_keys))
+        started = time.perf_counter()
+        compiled_specs: list[dict[str, Any]] = []
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as executor:
+            futures = [executor.submit(_precompile_spec, key) for key in spec_keys]
+            for future in concurrent.futures.as_completed(futures):
+                compiled = future.result()
+                compiled_specs.append(compiled)
+                print(
+                    "缓存就绪  "
+                    f"T={compiled['total_tokens']} "
+                    f"B={compiled['num_sequences']} "
+                    f"H={compiled['num_heads']}  "
+                    f"{compiled['seconds']:.3f} s"
+                )
+        compiled_specs.sort(
+            key=lambda item: (
+                item["total_tokens"],
+                item["num_sequences"],
+                item["num_heads"],
+            )
+        )
+        precompile = {
+            "workers": worker_count,
+            "unique_specs": len(spec_keys),
+            "wall_seconds": time.perf_counter() - started,
+            "specs": compiled_specs,
+        }
+        print(
+            f"并行预编译完成：{len(spec_keys)} 个静态 shape，"
+            f"workers={worker_count}，wall={precompile['wall_seconds']:.3f} s"
+        )
+
     device = _resolve_device(args.device)
     if device.type == "cpu":
         # CPU 参考计算最多使用 4 个线程。该设置仅作用于 CPU。
@@ -747,6 +827,7 @@ def main() -> None:
                 "environment": _environment(device),
                 "case_group": case_group,
                 "random_seed": random_seed,
+                "precompile": precompile,
                 "passed": True,
                 "correctness": correctness,
             },
@@ -791,6 +872,7 @@ def main() -> None:
         "case_group": case_group,
         "preset": args.preset,
         "settings": settings,
+        "precompile": precompile,
         "seed_count": seed_count,
         "correctness_mode": (
             "local_reference" if check_before_bench else "separate_official_oracle"

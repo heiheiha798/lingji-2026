@@ -210,8 +210,11 @@ python benchmark.py --mode test --case basic
 # 完整公开正确性检查
 python benchmark.py --mode test --case correctness
 
+# 新 kernel 首次遇到多个静态 shape 时并行预编译；GPU 检查仍然串行
+python benchmark.py --mode test --case correctness --compile-workers 4
+
 # 随机正确性测试：不计时，不进入性能结果
-python benchmark.py --mode test --random-correctness --random-count 5
+python benchmark.py --mode test --random-correctness --random-seed 20260809 --random-count 5 --compile-workers 4
 
 # 开发阶段固定性能测试，同时检查正确性并生成机器报告
 python benchmark.py --mode bench --case performance --json-out benchmark.json
@@ -219,6 +222,8 @@ python benchmark.py --mode bench --case performance --json-out benchmark.json
 # 公开性能用例的本地测试
 python benchmark.py --mode bench --case official --preset official --device cuda --json-out benchmark.json
 ```
+
+`--compile-workers N` 只并行预热不同 `(T, B, H)` 的 TileLang 磁盘 cache；正确性检查和性能测量仍按 case 串行执行。相同源码和静态 shape 的后续进程会直接加载 cache，不再重新 lowering。
 
 公开性能用例的本地命令用于测量性能。逐 Token 的 PyTorch 参考计算耗时较长，正式评测会先运行独立的正确性检查，再测量 4 个公开用例的性能。
 
