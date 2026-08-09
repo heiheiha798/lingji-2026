@@ -124,18 +124,24 @@ def main() -> None:
         )
         if segment_capacity <= 0:
             raise ValueError("workspace cannot hold one transformed chunk")
-        if num_sequences > 8:
-            segment_chunks = segment_capacity
-            segment_rounds = (
-                max_chunks + segment_chunks - 1
-            ) // segment_chunks
-        else:
-            segment_rounds = (
-                max_chunks + segment_capacity - 1
-            ) // segment_capacity
-            segment_chunks = (
-                max_chunks + segment_rounds - 1
-            ) // segment_rounds
+        if segment_capacity < num_sequences:
+            raise ValueError("workspace cannot hold one chunk per sequence")
+        segment_rounds = (
+            max_chunks + segment_capacity - 1
+        ) // segment_capacity
+        while (
+            (max_chunks + segment_rounds - 1) // segment_rounds
+            + num_sequences
+            - 1
+            > segment_capacity
+        ):
+            segment_rounds += 1
+        segment_chunks = min(
+            max_chunks,
+            (max_chunks + segment_rounds - 1) // segment_rounds
+            + num_sequences
+            - 1,
+        )
         print(
             f"{case_name}: build T={total_tokens}, B={num_sequences}, "
             f"H={num_heads}, segment_chunks={segment_chunks}",
@@ -157,6 +163,7 @@ def main() -> None:
                 num_sequences,
                 num_heads,
                 segment_chunks,
+                segment_rounds,
             )
         if "state" in stages:
             kernels["state"] = _compile_transformed_state_scan(
@@ -169,6 +176,7 @@ def main() -> None:
                     else (8 if num_sequences * num_heads <= 32 else 32)
                 ),
                 segment_chunks,
+                segment_rounds,
             )
         if "output" in stages:
             kernels["output"] = _compile_transformed_chunk_output(
@@ -176,6 +184,7 @@ def main() -> None:
                 num_sequences,
                 num_heads,
                 segment_chunks,
+                segment_rounds,
             )
         build_seconds = time.perf_counter() - started
 

@@ -1389,7 +1389,9 @@ def _compile_chunk_transform(
     num_sequences: int,
     num_heads: int,
     segment_chunks: int,
+    segment_rounds: int,
 ):
+    single_sequence_chunks = (total_tokens + _CHUNK_SIZE - 1) // _CHUNK_SIZE
     token_shape = (total_tokens, num_heads, _HEAD_DIM)
     a_log_shape = (num_heads,)
     dt_bias_shape = (num_heads, _HEAD_DIM)
@@ -1416,13 +1418,12 @@ def _compile_chunk_transform(
         KForward: T.Tensor(transform_shape, T.bfloat16),
         KUpdate: T.Tensor(transform_shape, T.bfloat16),
         Decay: T.Tensor(decay_shape, T.float32),
-        SegmentStart: T.int32,
+        SegmentRound: T.int32,
     ):
         with T.Kernel(
             segment_chunks, num_heads, threads=_THREADS
         ) as (segment_chunk, head):
             thread = T.get_thread_binding(0)
-            chunk_id = segment_chunk + SegmentStart
             sequence_id = T.alloc_local((1,), T.int32)
             chunk_in_sequence = T.alloc_local((1,), T.int32)
             chunk_prefix = T.alloc_local((1,), T.int32)
@@ -1430,18 +1431,41 @@ def _compile_chunk_transform(
             sequence_id[0] = -1
             chunk_in_sequence[0] = 0
             chunk_prefix[0] = 0
-            for sequence in T.serial(num_sequences):
-                sequence_chunks = T.ceildiv(
-                    CuSeqLens[sequence + 1] - CuSeqLens[sequence],
-                    _CHUNK_SIZE,
+            if num_sequences == 1:
+                first_chunk = (
+                    single_sequence_chunks * SegmentRound
+                    // segment_rounds
                 )
-                if (
-                    chunk_id >= chunk_prefix[0]
-                    and chunk_id < chunk_prefix[0] + sequence_chunks
-                ):
-                    sequence_id[0] = sequence
-                    chunk_in_sequence[0] = chunk_id - chunk_prefix[0]
-                chunk_prefix[0] += sequence_chunks
+                last_chunk = (
+                    single_sequence_chunks * (SegmentRound + 1)
+                    // segment_rounds
+                )
+                if segment_chunk < last_chunk - first_chunk:
+                    sequence_id[0] = 0
+                    chunk_in_sequence[0] = first_chunk + segment_chunk
+            else:
+                for sequence in T.serial(num_sequences):
+                    sequence_chunks = T.ceildiv(
+                        CuSeqLens[sequence + 1] - CuSeqLens[sequence],
+                        _CHUNK_SIZE,
+                    )
+                    first_chunk = (
+                        sequence_chunks * SegmentRound // segment_rounds
+                    )
+                    last_chunk = (
+                        sequence_chunks * (SegmentRound + 1)
+                        // segment_rounds
+                    )
+                    if (
+                        segment_chunk >= chunk_prefix[0]
+                        and segment_chunk
+                        < chunk_prefix[0] + last_chunk - first_chunk
+                    ):
+                        sequence_id[0] = sequence
+                        chunk_in_sequence[0] = (
+                            first_chunk + segment_chunk - chunk_prefix[0]
+                        )
+                    chunk_prefix[0] += last_chunk - first_chunk
 
             if sequence_id[0] >= 0:
                 chunk_start = (
@@ -1587,7 +1611,9 @@ def _compile_transformed_state_scan(
     num_heads: int,
     value_tile: int,
     segment_chunks: int,
+    segment_rounds: int,
 ):
+    single_sequence_chunks = (total_tokens + _CHUNK_SIZE - 1) // _CHUNK_SIZE
     token_shape = (total_tokens, num_heads, _HEAD_DIM)
     beta_shape = (total_tokens, num_heads)
     state_shape = (
@@ -1625,7 +1651,7 @@ def _compile_transformed_state_scan(
         StateScratch: T.Tensor(scratch_shape, T.bfloat16),
         VNew: T.Tensor(token_shape, T.bfloat16),
         FinalState: T.Tensor(state_shape, T.bfloat16),
-        SegmentStart: T.int32,
+        SegmentRound: T.int32,
     ):
         with T.Kernel(
             T.ceildiv(_HEAD_DIM, value_tile),
@@ -1661,20 +1687,36 @@ def _compile_transformed_state_scan(
             sequence_length = CuSeqLens[sequence + 1] - sequence_start
             sequence_chunks = T.ceildiv(sequence_length, _CHUNK_SIZE)
             chunk_prefix[0] = 0
-            for prior_sequence in T.serial(num_sequences):
-                if prior_sequence < sequence:
-                    chunk_prefix[0] += T.ceildiv(
-                        CuSeqLens[prior_sequence + 1]
-                        - CuSeqLens[prior_sequence],
-                        _CHUNK_SIZE,
-                    )
-            first_chunk[0] = T.max(
-                0, SegmentStart - chunk_prefix[0]
-            )
-            last_chunk[0] = T.min(
-                sequence_chunks,
-                SegmentStart + segment_chunks - chunk_prefix[0],
-            )
+            if num_sequences == 1:
+                first_chunk[0] = (
+                    single_sequence_chunks * SegmentRound
+                    // segment_rounds
+                )
+                last_chunk[0] = (
+                    single_sequence_chunks * (SegmentRound + 1)
+                    // segment_rounds
+                )
+            else:
+                for prior_sequence in T.serial(num_sequences):
+                    if prior_sequence < sequence:
+                        prior_chunks = T.ceildiv(
+                            CuSeqLens[prior_sequence + 1]
+                            - CuSeqLens[prior_sequence],
+                            _CHUNK_SIZE,
+                        )
+                        chunk_prefix[0] += (
+                            prior_chunks * (SegmentRound + 1)
+                            // segment_rounds
+                            - prior_chunks * SegmentRound
+                            // segment_rounds
+                        )
+                first_chunk[0] = (
+                    sequence_chunks * SegmentRound // segment_rounds
+                )
+                last_chunk[0] = (
+                    sequence_chunks * (SegmentRound + 1)
+                    // segment_rounds
+                )
 
             if first_chunk[0] < last_chunk[0]:
                 if first_chunk[0] == 0:
@@ -1708,7 +1750,9 @@ def _compile_transformed_state_scan(
                         _CHUNK_SIZE,
                         sequence_length - chunk * _CHUNK_SIZE,
                     )
-                    scratch_chunk = chunk_prefix[0] + chunk - SegmentStart
+                    scratch_chunk = (
+                        chunk_prefix[0] + chunk - first_chunk[0]
+                    )
 
                     T.async_copy(
                         KForward[
@@ -1829,7 +1873,9 @@ def _compile_transformed_chunk_output(
     num_sequences: int,
     num_heads: int,
     segment_chunks: int,
+    segment_rounds: int,
 ):
+    single_sequence_chunks = (total_tokens + _CHUNK_SIZE - 1) // _CHUNK_SIZE
     value_tile = 64
     token_shape = (total_tokens, num_heads, _HEAD_DIM)
     cu_shape = (num_sequences + 1,)
@@ -1854,7 +1900,7 @@ def _compile_transformed_chunk_output(
         QG: T.Tensor(transform_shape, T.bfloat16),
         StateScratch: T.Tensor(scratch_shape, T.bfloat16),
         VNewOut: T.Tensor(token_shape, T.bfloat16),
-        SegmentStart: T.int32,
+        SegmentRound: T.int32,
     ):
         with T.Kernel(
             segment_chunks,
@@ -1862,7 +1908,6 @@ def _compile_transformed_chunk_output(
             num_heads,
             threads=_THREADS,
         ) as (segment_chunk, value_block, head):
-            chunk_id = segment_chunk + SegmentStart
             sequence_id = T.alloc_local((1,), T.int32)
             chunk_in_sequence = T.alloc_local((1,), T.int32)
             chunk_prefix = T.alloc_local((1,), T.int32)
@@ -1870,18 +1915,41 @@ def _compile_transformed_chunk_output(
             sequence_id[0] = -1
             chunk_in_sequence[0] = 0
             chunk_prefix[0] = 0
-            for sequence in T.serial(num_sequences):
-                sequence_chunks = T.ceildiv(
-                    CuSeqLens[sequence + 1] - CuSeqLens[sequence],
-                    _CHUNK_SIZE,
+            if num_sequences == 1:
+                first_chunk = (
+                    single_sequence_chunks * SegmentRound
+                    // segment_rounds
                 )
-                if (
-                    chunk_id >= chunk_prefix[0]
-                    and chunk_id < chunk_prefix[0] + sequence_chunks
-                ):
-                    sequence_id[0] = sequence
-                    chunk_in_sequence[0] = chunk_id - chunk_prefix[0]
-                chunk_prefix[0] += sequence_chunks
+                last_chunk = (
+                    single_sequence_chunks * (SegmentRound + 1)
+                    // segment_rounds
+                )
+                if segment_chunk < last_chunk - first_chunk:
+                    sequence_id[0] = 0
+                    chunk_in_sequence[0] = first_chunk + segment_chunk
+            else:
+                for sequence in T.serial(num_sequences):
+                    sequence_chunks = T.ceildiv(
+                        CuSeqLens[sequence + 1] - CuSeqLens[sequence],
+                        _CHUNK_SIZE,
+                    )
+                    first_chunk = (
+                        sequence_chunks * SegmentRound // segment_rounds
+                    )
+                    last_chunk = (
+                        sequence_chunks * (SegmentRound + 1)
+                        // segment_rounds
+                    )
+                    if (
+                        segment_chunk >= chunk_prefix[0]
+                        and segment_chunk
+                        < chunk_prefix[0] + last_chunk - first_chunk
+                    ):
+                        sequence_id[0] = sequence
+                        chunk_in_sequence[0] = (
+                            first_chunk + segment_chunk - chunk_prefix[0]
+                        )
+                    chunk_prefix[0] += last_chunk - first_chunk
 
             if sequence_id[0] >= 0:
                 chunk_start = (
@@ -2000,15 +2068,24 @@ class Submission:
         )
         if segment_capacity <= 0:
             raise ValueError("workspace cannot hold one transformed chunk")
-        if num_sequences > 8:
-            segment_chunks = segment_capacity
-        else:
-            segment_rounds = (
-                max_chunks + segment_capacity - 1
-            ) // segment_capacity
-            segment_chunks = (
-                max_chunks + segment_rounds - 1
-            ) // segment_rounds
+        if segment_capacity < num_sequences:
+            raise ValueError("workspace cannot hold one chunk per sequence")
+        segment_rounds = (
+            max_chunks + segment_capacity - 1
+        ) // segment_capacity
+        while (
+            (max_chunks + segment_rounds - 1) // segment_rounds
+            + num_sequences
+            - 1
+            > segment_capacity
+        ):
+            segment_rounds += 1
+        segment_chunks = min(
+            max_chunks,
+            (max_chunks + segment_rounds - 1) // segment_rounds
+            + num_sequences
+            - 1,
+        )
 
         chunk_diagonal = _compile_chunk_diagonal(
             total_tokens, num_sequences, num_heads
@@ -2021,6 +2098,7 @@ class Submission:
             num_sequences,
             num_heads,
             segment_chunks,
+            segment_rounds,
         )
         state_scan = _compile_transformed_state_scan(
             total_tokens,
@@ -2032,12 +2110,14 @@ class Submission:
                 else (8 if num_sequences * num_heads <= 32 else 32)
             ),
             segment_chunks,
+            segment_rounds,
         )
         chunk_output = _compile_transformed_chunk_output(
             total_tokens,
             num_sequences,
             num_heads,
             segment_chunks,
+            segment_rounds,
         )
         return (
             chunk_diagonal,
@@ -2048,6 +2128,7 @@ class Submission:
             operator_elements,
             scratch_offset,
             segment_chunks,
+            segment_rounds,
             max_chunks,
         )
 
@@ -2077,6 +2158,7 @@ class Submission:
             operator_elements,
             scratch_offset,
             segment_chunks,
+            segment_rounds,
             max_chunks,
         ) = state
         workspace_bf16 = workspace.view(torch.bfloat16)
@@ -2179,7 +2261,7 @@ class Submission:
             norm,
             beta,
         )
-        for segment_start in range(0, max_chunks, segment_chunks):
+        for segment_round in range(segment_rounds):
             chunk_transform(
                 q,
                 k,
@@ -2192,7 +2274,7 @@ class Submission:
                 k_forward_scratch,
                 k_update_scratch,
                 decay_scratch,
-                segment_start,
+                segment_round,
             )
             state_scan(
                 v,
@@ -2206,7 +2288,7 @@ class Submission:
                 state_scratch,
                 out,
                 final_state,
-                segment_start,
+                segment_round,
             )
             chunk_output(
                 cu_seqlens,
@@ -2214,5 +2296,5 @@ class Submission:
                 qg_scratch,
                 state_scratch,
                 out,
-                segment_start,
+                segment_round,
             )
