@@ -126,215 +126,213 @@ def _compile_chunk_diagonal(total_tokens: int, num_sequences: int, num_heads: in
                 gate_prefix = T.alloc_local((1,), T.float32)
                 a_scale = T.alloc_local((1,), T.float32)
 
-                if valid_subchunk > 0:
-                    a_scale[0] = T.exp(ALog[head])
-                    for row, dim in T.Parallel(_SUBCHUNK_SIZE, _HEAD_DIM):
-                        q_shared[row, dim] = T.if_then_else(
-                            row < valid_subchunk,
-                            Q[
+                a_scale[0] = T.exp(ALog[head])
+                for row, dim in T.Parallel(_SUBCHUNK_SIZE, _HEAD_DIM):
+                    q_shared[row, dim] = T.if_then_else(
+                        row < valid_subchunk,
+                        Q[
+                            chunk_start + subchunk_offset + row,
+                            head,
+                            dim,
+                        ],
+                        T.cast(0.0, T.bfloat16),
+                    )
+                    k_shared[row, dim] = T.if_then_else(
+                        row < valid_subchunk,
+                        K[
+                            chunk_start + subchunk_offset + row,
+                            head,
+                            dim,
+                        ],
+                        T.cast(0.0, T.bfloat16),
+                    )
+                    g_shared[row, dim] = T.if_then_else(
+                        row < valid_subchunk,
+                        _LOG2_GATE_SCALE
+                        * T.sigmoid(
+                            a_scale[0]
+                            * (
+                                GRaw[
+                                    chunk_start + subchunk_offset + row,
+                                    head,
+                                    dim,
+                                ]
+                                + DtBias[head, dim]
+                            )
+                        ),
+                        0.0,
+                    )
+                for row in T.Parallel(_SUBCHUNK_SIZE):
+                    beta[row] = T.if_then_else(
+                        row < valid_subchunk,
+                        T.sigmoid(
+                            BetaRaw[
                                 chunk_start + subchunk_offset + row,
                                 head,
-                                dim,
-                            ],
-                            T.cast(0.0, T.bfloat16),
+                            ]
+                        ),
+                        T.cast(0.0, T.bfloat16),
+                    )
+                    if row < valid_subchunk:
+                        Beta[
+                            chunk_start + subchunk_offset + row,
+                            head,
+                        ] = beta[row]
+                T.sync_threads()
+
+                for row_group in T.serial(
+                    _SUBCHUNK_SIZE // (_DIAGONAL_THREADS // _WARP_SIZE)
+                ):
+                    row = (
+                        row_group * (_DIAGONAL_THREADS // _WARP_SIZE) + warp
+                    )
+                    q_norm_partial[0] = 0.0
+                    k_norm_partial[0] = 0.0
+                    for dim_slot in T.unroll(_HEAD_DIM // _WARP_SIZE):
+                        dim = lane * (_HEAD_DIM // _WARP_SIZE) + dim_slot
+                        q_norm_partial[0] += (
+                            T.cast(q_shared[row, dim], T.float32)
+                            * T.cast(q_shared[row, dim], T.float32)
                         )
-                        k_shared[row, dim] = T.if_then_else(
-                            row < valid_subchunk,
-                            K[
+                        k_norm_partial[0] += (
+                            T.cast(k_shared[row, dim], T.float32)
+                            * T.cast(k_shared[row, dim], T.float32)
+                        )
+                    q_norm_partial[0] = T.warp_reduce_sum(q_norm_partial[0])
+                    k_norm_partial[0] = T.warp_reduce_sum(k_norm_partial[0])
+                    if lane == 0:
+                        q_norm[row] = T.rsqrt(q_norm_partial[0] + 1.0e-6)
+                        k_norm[row] = T.rsqrt(k_norm_partial[0] + 1.0e-6)
+                        if row < valid_subchunk:
+                            Norm[
                                 chunk_start + subchunk_offset + row,
                                 head,
-                                dim,
-                            ],
-                            T.cast(0.0, T.bfloat16),
-                        )
-                        g_shared[row, dim] = T.if_then_else(
+                                0,
+                            ] = q_norm[row]
+                            Norm[
+                                chunk_start + subchunk_offset + row,
+                                head,
+                                1,
+                            ] = k_norm[row]
+                T.sync_threads()
+
+                for dim in T.Parallel(_HEAD_DIM):
+                    gate_prefix[0] = g_shared[0, dim]
+                    for row in T.serial(1, _SUBCHUNK_SIZE):
+                        gate_prefix[0] += g_shared[row, dim]
+                        g_shared[row, dim] = gate_prefix[0]
+                T.sync_threads()
+
+                T.clear(combined_fragment)
+                for dim_block in T.serial(_HEAD_DIM // _WARP_SIZE):
+                    for row, dim in T.Parallel(
+                        _SUBCHUNK_SIZE, _WARP_SIZE
+                    ):
+                        dim_index = dim_block * _WARP_SIZE + dim
+                        gate_reference = g_shared[0, dim_index]
+                        left_qk[row, dim] = T.if_then_else(
                             row < valid_subchunk,
-                            _LOG2_GATE_SCALE
-                            * T.sigmoid(
-                                a_scale[0]
-                                * (
-                                    GRaw[
-                                        chunk_start + subchunk_offset + row,
-                                        head,
-                                        dim,
-                                    ]
-                                    + DtBias[head, dim]
-                                )
+                            T.cast(q_shared[row, dim_index], T.float32)
+                            * q_norm[row]
+                            * T.exp2(
+                                g_shared[row, dim_index] - gate_reference
+                            )
+                            * _INV_SQRT_HEAD_DIM,
+                            0.0,
+                        )
+                        left_qk[_SUBCHUNK_SIZE + row, dim] = T.if_then_else(
+                            row < valid_subchunk,
+                            T.cast(k_shared[row, dim_index], T.float32)
+                            * k_norm[row]
+                            * T.cast(beta[row], T.float32)
+                            * T.exp2(
+                                g_shared[row, dim_index] - gate_reference
                             ),
                             0.0,
                         )
-                    for row in T.Parallel(_SUBCHUNK_SIZE):
-                        beta[row] = T.if_then_else(
+                        right_k[row, dim] = T.if_then_else(
                             row < valid_subchunk,
-                            T.sigmoid(
-                                BetaRaw[
-                                    chunk_start + subchunk_offset + row,
-                                    head,
-                                ]
+                            T.cast(k_shared[row, dim_index], T.float32)
+                            * k_norm[row]
+                            * T.exp2(
+                                gate_reference - g_shared[row, dim_index]
                             ),
-                            T.cast(0.0, T.bfloat16),
+                            0.0,
                         )
-                        if row < valid_subchunk:
-                            Beta[
-                                chunk_start + subchunk_offset + row,
-                                head,
-                            ] = beta[row]
                     T.sync_threads()
+                    T.gemm(
+                        left_qk,
+                        right_k,
+                        combined_fragment,
+                        transpose_B=True,
+                    )
 
-                    for row_group in T.serial(
-                        _SUBCHUNK_SIZE // (_DIAGONAL_THREADS // _WARP_SIZE)
-                    ):
-                        row = (
-                            row_group * (_DIAGONAL_THREADS // _WARP_SIZE) + warp
+                T.copy(combined_fragment, combined_shared)
+                T.sync_threads()
+                T.clear(inverse_shared)
+                for row, column in T.Parallel(
+                    _SUBCHUNK_SIZE, _SUBCHUNK_SIZE
+                ):
+                    if row < valid_subchunk and column < row:
+                        inverse_shared[row, column] = combined_shared[
+                            _SUBCHUNK_SIZE + row, column
+                        ]
+                T.sync_threads()
+
+                for row in T.serial(_SUBCHUNK_SIZE):
+                    for column in T.Parallel(_SUBCHUNK_SIZE):
+                        coefficient_row[column] = T.if_then_else(
+                            column < row,
+                            inverse_shared[row, column],
+                            0.0,
                         )
-                        q_norm_partial[0] = 0.0
-                        k_norm_partial[0] = 0.0
-                        for dim_slot in T.unroll(_HEAD_DIM // _WARP_SIZE):
-                            dim = lane * (_HEAD_DIM // _WARP_SIZE) + dim_slot
-                            q_norm_partial[0] += (
-                                T.cast(q_shared[row, dim], T.float32)
-                                * T.cast(q_shared[row, dim], T.float32)
-                            )
-                            k_norm_partial[0] += (
-                                T.cast(k_shared[row, dim], T.float32)
-                                * T.cast(k_shared[row, dim], T.float32)
-                            )
-                        q_norm_partial[0] = T.warp_reduce_sum(q_norm_partial[0])
-                        k_norm_partial[0] = T.warp_reduce_sum(k_norm_partial[0])
-                        if lane == 0:
-                            q_norm[row] = T.rsqrt(q_norm_partial[0] + 1.0e-6)
-                            k_norm[row] = T.rsqrt(k_norm_partial[0] + 1.0e-6)
-                            if row < valid_subchunk:
-                                Norm[
-                                    chunk_start + subchunk_offset + row,
-                                    head,
-                                    0,
-                                ] = q_norm[row]
-                                Norm[
-                                    chunk_start + subchunk_offset + row,
-                                    head,
-                                    1,
-                                ] = k_norm[row]
                     T.sync_threads()
-
-                    for dim in T.Parallel(_HEAD_DIM):
-                        gate_prefix[0] = g_shared[0, dim]
-                        for row in T.serial(1, _SUBCHUNK_SIZE):
-                            gate_prefix[0] += g_shared[row, dim]
-                            g_shared[row, dim] = gate_prefix[0]
-                    T.sync_threads()
-
-                    T.clear(combined_fragment)
-                    for dim_block in T.serial(_HEAD_DIM // _WARP_SIZE):
-                        for row, dim in T.Parallel(
-                            _SUBCHUNK_SIZE, _WARP_SIZE
-                        ):
-                            dim_index = dim_block * _WARP_SIZE + dim
-                            gate_reference = g_shared[0, dim_index]
-                            left_qk[row, dim] = T.if_then_else(
-                                row < valid_subchunk,
-                                T.cast(q_shared[row, dim_index], T.float32)
-                                * q_norm[row]
-                                * T.exp2(
-                                    g_shared[row, dim_index] - gate_reference
-                                )
-                                * _INV_SQRT_HEAD_DIM,
-                                0.0,
-                            )
-                            left_qk[_SUBCHUNK_SIZE + row, dim] = T.if_then_else(
-                                row < valid_subchunk,
-                                T.cast(k_shared[row, dim_index], T.float32)
-                                * k_norm[row]
-                                * T.cast(beta[row], T.float32)
-                                * T.exp2(
-                                    g_shared[row, dim_index] - gate_reference
-                                ),
-                                0.0,
-                            )
-                            right_k[row, dim] = T.if_then_else(
-                                row < valid_subchunk,
-                                T.cast(k_shared[row, dim_index], T.float32)
-                                * k_norm[row]
-                                * T.exp2(
-                                    gate_reference - g_shared[row, dim_index]
-                                ),
-                                0.0,
-                            )
-                        T.sync_threads()
-                        T.gemm(
-                            left_qk,
-                            right_k,
-                            combined_fragment,
-                            transpose_B=True,
+                    if thread < _SUBCHUNK_SIZE:
+                        inverse_accumulator[0] = T.if_then_else(
+                            thread < row,
+                            -coefficient_row[thread],
+                            0.0,
                         )
-
-                    T.copy(combined_fragment, combined_shared)
+                        for inner in T.serial(_SUBCHUNK_SIZE):
+                            if inner < row and thread < inner:
+                                inverse_coefficient[0] = coefficient_row[
+                                    inner
+                                ]
+                                inverse_accumulator[0] -= (
+                                    inverse_coefficient[0]
+                                    * inverse_shared[inner, thread]
+                                )
+                        inverse_shared[row, thread] = T.if_then_else(
+                            thread < row,
+                            inverse_accumulator[0],
+                            T.if_then_else(thread == row, 1.0, 0.0),
+                        )
                     T.sync_threads()
-                    T.clear(inverse_shared)
-                    for row, column in T.Parallel(
-                        _SUBCHUNK_SIZE, _SUBCHUNK_SIZE
-                    ):
-                        if row < valid_subchunk and column < row:
-                            inverse_shared[row, column] = combined_shared[
-                                _SUBCHUNK_SIZE + row, column
-                            ]
-                    T.sync_threads()
 
-                    for row in T.serial(_SUBCHUNK_SIZE):
-                        if row < valid_subchunk:
-                            for column in T.Parallel(_SUBCHUNK_SIZE):
-                                coefficient_row[column] = T.if_then_else(
-                                    column < row,
-                                    inverse_shared[row, column],
-                                    0.0,
-                                )
-                            T.sync_threads()
-                            if thread < _SUBCHUNK_SIZE:
-                                inverse_accumulator[0] = T.if_then_else(
-                                    thread < row,
-                                    -coefficient_row[thread],
-                                    0.0,
-                                )
-                                for inner in T.serial(_SUBCHUNK_SIZE):
-                                    if inner < row and thread < inner:
-                                        inverse_coefficient[0] = coefficient_row[
-                                            inner
-                                        ]
-                                        inverse_accumulator[0] -= (
-                                            inverse_coefficient[0]
-                                            * inverse_shared[inner, thread]
-                                        )
-                                inverse_shared[row, thread] = T.if_then_else(
-                                    thread < row,
-                                    inverse_accumulator[0],
-                                    T.if_then_else(thread == row, 1.0, 0.0),
-                                )
-                            T.sync_threads()
-
-                    for row, column in T.Parallel(
-                        _SUBCHUNK_SIZE, _CHUNK_SIZE
-                    ):
-                        if row < valid_subchunk:
+                for row, column in T.Parallel(
+                    _SUBCHUNK_SIZE, _CHUNK_SIZE
+                ):
+                    if row < valid_subchunk:
+                        Aqk[
+                            chunk_start + subchunk_offset + row,
+                            head,
+                            column,
+                        ] = T.cast(0.0, T.bfloat16)
+                for row, column in T.Parallel(
+                    _SUBCHUNK_SIZE, _SUBCHUNK_SIZE
+                ):
+                    if row < valid_subchunk:
+                        AInvDiagonal[
+                            chunk_start + subchunk_offset + row,
+                            head,
+                            column,
+                        ] = inverse_shared[row, column]
+                        if column <= row:
                             Aqk[
                                 chunk_start + subchunk_offset + row,
                                 head,
-                                column,
-                            ] = T.cast(0.0, T.bfloat16)
-                    for row, column in T.Parallel(
-                        _SUBCHUNK_SIZE, _SUBCHUNK_SIZE
-                    ):
-                        if row < valid_subchunk:
-                            AInvDiagonal[
-                                chunk_start + subchunk_offset + row,
-                                head,
-                                column,
-                            ] = inverse_shared[row, column]
-                            if column <= row:
-                                Aqk[
-                                    chunk_start + subchunk_offset + row,
-                                    head,
-                                    subchunk_offset + column,
-                                ] = combined_shared[row, column]
+                                subchunk_offset + column,
+                            ] = combined_shared[row, column]
 
     return kernel
 
