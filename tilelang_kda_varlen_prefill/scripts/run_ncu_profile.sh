@@ -71,7 +71,8 @@ export PYTHONUNBUFFERED=1
     --section InstructionStats \
     --section SourceCounters \
     --export "$report_base" \
-    "$python_bin" "$task_dir/profile_ncu.py" --case "$case_name"
+    "$python_bin" "$task_dir/profile_ncu.py" --case "$case_name" \
+    2>&1 | tee "$output_dir/run.log"
 
 "$ncu_bin" --import "$report_path" --page raw --csv \
     --print-units base --print-fp > "$output_dir/raw.csv"

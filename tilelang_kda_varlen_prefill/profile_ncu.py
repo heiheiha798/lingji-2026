@@ -45,8 +45,10 @@ def main() -> None:
     torch.cuda.synchronize(device)
 
     torch.cuda.cudart().cudaProfilerStart()
+    torch.cuda.nvtx.range_push(f"TileLang_{args.case}")
     submission.run(state, *inputs)
     torch.cuda.synchronize(device)
+    torch.cuda.nvtx.range_pop()
     torch.cuda.cudart().cudaProfilerStop()
     print(
         f"profiled {args.case}: T={spec.total_tokens} "
