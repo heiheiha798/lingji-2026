@@ -106,6 +106,8 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                 coefficient_row = T.alloc_shared(
                     (_CHUNK_SIZE,), T.float32
                 )
+                inverse_accumulator = T.alloc_local((2,), T.float32)
+                inverse_coefficient = T.alloc_local((1,), T.float32)
 
                 a_scale[0] = T.exp(ALog[head])
                 T.copy(
@@ -260,21 +262,36 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                                 0.0,
                             )
                         T.sync_threads()
-                        for column in T.Parallel(_CHUNK_SIZE):
-                            if column < row:
-                                ainv_shared[row, column] = -coefficient_row[
-                                    column
-                                ]
-                                for inner in T.serial(_CHUNK_SIZE):
-                                    if inner > column and inner < row:
-                                        ainv_shared[row, column] -= (
-                                            coefficient_row[inner]
+                        for column_slot in T.serial(2):
+                            column = (
+                                column_slot * _OPERATOR_THREADS + thread
+                            )
+                            inverse_accumulator[column_slot] = T.if_then_else(
+                                column < row,
+                                -coefficient_row[column],
+                                0.0,
+                            )
+                        for inner in T.serial(_CHUNK_SIZE):
+                            if inner < row:
+                                inverse_coefficient[0] = coefficient_row[inner]
+                                for column_slot in T.serial(2):
+                                    column = (
+                                        column_slot * _OPERATOR_THREADS + thread
+                                    )
+                                    if column < inner:
+                                        inverse_accumulator[column_slot] -= (
+                                            inverse_coefficient[0]
                                             * ainv_shared[inner, column]
                                         )
-                            if column == row:
-                                ainv_shared[row, column] = 1.0
-                            if column > row:
-                                ainv_shared[row, column] = 0.0
+                        for column_slot in T.serial(2):
+                            column = (
+                                column_slot * _OPERATOR_THREADS + thread
+                            )
+                            ainv_shared[row, column] = T.if_then_else(
+                                column < row,
+                                inverse_accumulator[column_slot],
+                                T.if_then_else(column == row, 1.0, 0.0),
+                            )
                         T.sync_threads()
 
                 for row, column in T.Parallel(
