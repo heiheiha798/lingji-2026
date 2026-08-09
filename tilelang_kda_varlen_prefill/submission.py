@@ -120,12 +120,12 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                     q_shared[row, dim] = T.if_then_else(
                         row < valid_tokens,
                         Q[chunk_start + row, head, dim],
-                        0.0,
+                        T.cast(0.0, T.bfloat16),
                     )
                     k_shared[row, dim] = T.if_then_else(
                         row < valid_tokens,
                         K[chunk_start + row, head, dim],
-                        0.0,
+                        T.cast(0.0, T.bfloat16),
                     )
                     g_shared[row, dim] = T.if_then_else(
                         row < valid_tokens,
