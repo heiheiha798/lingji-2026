@@ -11,7 +11,11 @@ from typing import Any
 
 from benchmark import OpSpec
 from cuda_static_metrics import analyze_cuda_source
-from submission import _compile_chunk_operators, _compile_persistent_recurrence
+from submission import (
+    _compile_chunk_diagonal,
+    _compile_chunk_inter,
+    _compile_persistent_recurrence,
+)
 from tilelang.env import env
 
 
@@ -53,7 +57,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--stage",
-        choices=("preprocess", "persistent", "both"),
+        choices=("preprocess", "diagonal", "inter", "persistent", "both"),
         default="both",
     )
     parser.add_argument("--output", type=Path, required=True)
@@ -67,11 +71,12 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.artifacts_dir.mkdir(parents=True)
     env.disable_cache()
-    stages = (
-        ("preprocess", "persistent")
-        if args.stage == "both"
-        else (args.stage,)
-    )
+    if args.stage == "both":
+        stages = ("diagonal", "inter", "persistent")
+    elif args.stage == "preprocess":
+        stages = ("diagonal", "inter")
+    else:
+        stages = (args.stage,)
 
     submission_path = Path(__file__).with_name("submission.py")
     result: dict[str, Any] = {
@@ -99,8 +104,12 @@ def main() -> None:
         )
         started = time.perf_counter()
         kernels: dict[str, Any] = {}
-        if "preprocess" in stages:
-            kernels["preprocess"] = _compile_chunk_operators(
+        if "diagonal" in stages:
+            kernels["diagonal"] = _compile_chunk_diagonal(
+                total_tokens, num_sequences, num_heads
+            )
+        if "inter" in stages:
+            kernels["inter"] = _compile_chunk_inter(
                 total_tokens, num_sequences, num_heads
             )
         if "persistent" in stages:
