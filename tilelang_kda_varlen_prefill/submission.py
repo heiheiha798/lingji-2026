@@ -1948,7 +1948,7 @@ def _compile_transformed_chunk_output(
             segment_chunks,
             T.ceildiv(_HEAD_DIM, value_tile),
             num_heads,
-            threads=_THREADS,
+            threads=256,
         ) as (segment_chunk, value_block, head):
             sequence_id = T.alloc_local((1,), T.int32)
             chunk_in_sequence = T.alloc_local((1,), T.int32)
