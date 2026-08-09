@@ -64,27 +64,38 @@ def _compile_chunk_diagonal(total_tokens: int, num_sequences: int, num_heads: in
             sequence_id[0] = -1
             chunk_in_sequence[0] = 0
             chunk_prefix[0] = 0
-            for sequence in T.serial(num_sequences):
-                sequence_chunks = T.ceildiv(
-                    CuSeqLens[sequence + 1] - CuSeqLens[sequence], _CHUNK_SIZE
-                )
-                if (
-                    chunk_id >= chunk_prefix[0]
-                    and chunk_id < chunk_prefix[0] + sequence_chunks
-                ):
-                    sequence_id[0] = sequence
-                    chunk_in_sequence[0] = chunk_id - chunk_prefix[0]
-                chunk_prefix[0] += sequence_chunks
+            if num_sequences == 1:
+                sequence_id[0] = 0
+                chunk_in_sequence[0] = chunk_id
+            else:
+                for sequence in T.serial(num_sequences):
+                    sequence_chunks = T.ceildiv(
+                        CuSeqLens[sequence + 1] - CuSeqLens[sequence],
+                        _CHUNK_SIZE,
+                    )
+                    if (
+                        chunk_id >= chunk_prefix[0]
+                        and chunk_id < chunk_prefix[0] + sequence_chunks
+                    ):
+                        sequence_id[0] = sequence
+                        chunk_in_sequence[0] = chunk_id - chunk_prefix[0]
+                    chunk_prefix[0] += sequence_chunks
 
             if sequence_id[0] >= 0:
-                chunk_start = (
-                    CuSeqLens[sequence_id[0]]
-                    + chunk_in_sequence[0] * _CHUNK_SIZE
-                )
-                valid_tokens = T.min(
-                    _CHUNK_SIZE,
-                    CuSeqLens[sequence_id[0] + 1] - chunk_start,
-                )
+                if num_sequences == 1:
+                    chunk_start = chunk_in_sequence[0] * _CHUNK_SIZE
+                    valid_tokens = T.min(
+                        _CHUNK_SIZE, total_tokens - chunk_start
+                    )
+                else:
+                    chunk_start = (
+                        CuSeqLens[sequence_id[0]]
+                        + chunk_in_sequence[0] * _CHUNK_SIZE
+                    )
+                    valid_tokens = T.min(
+                        _CHUNK_SIZE,
+                        CuSeqLens[sequence_id[0] + 1] - chunk_start,
+                    )
                 subchunk_offset = subchunk * _SUBCHUNK_SIZE
                 valid_subchunk = T.min(
                     _SUBCHUNK_SIZE,
@@ -378,27 +389,38 @@ def _compile_chunk_inter(total_tokens: int, num_sequences: int, num_heads: int):
             sequence_id[0] = -1
             chunk_in_sequence[0] = 0
             chunk_prefix[0] = 0
-            for sequence in T.serial(num_sequences):
-                sequence_chunks = T.ceildiv(
-                    CuSeqLens[sequence + 1] - CuSeqLens[sequence], _CHUNK_SIZE
-                )
-                if (
-                    chunk_id >= chunk_prefix[0]
-                    and chunk_id < chunk_prefix[0] + sequence_chunks
-                ):
-                    sequence_id[0] = sequence
-                    chunk_in_sequence[0] = chunk_id - chunk_prefix[0]
-                chunk_prefix[0] += sequence_chunks
+            if num_sequences == 1:
+                sequence_id[0] = 0
+                chunk_in_sequence[0] = chunk_id
+            else:
+                for sequence in T.serial(num_sequences):
+                    sequence_chunks = T.ceildiv(
+                        CuSeqLens[sequence + 1] - CuSeqLens[sequence],
+                        _CHUNK_SIZE,
+                    )
+                    if (
+                        chunk_id >= chunk_prefix[0]
+                        and chunk_id < chunk_prefix[0] + sequence_chunks
+                    ):
+                        sequence_id[0] = sequence
+                        chunk_in_sequence[0] = chunk_id - chunk_prefix[0]
+                    chunk_prefix[0] += sequence_chunks
 
             if sequence_id[0] >= 0:
-                chunk_start = (
-                    CuSeqLens[sequence_id[0]]
-                    + chunk_in_sequence[0] * _CHUNK_SIZE
-                )
-                valid_tokens = T.min(
-                    _CHUNK_SIZE,
-                    CuSeqLens[sequence_id[0] + 1] - chunk_start,
-                )
+                if num_sequences == 1:
+                    chunk_start = chunk_in_sequence[0] * _CHUNK_SIZE
+                    valid_tokens = T.min(
+                        _CHUNK_SIZE, total_tokens - chunk_start
+                    )
+                else:
+                    chunk_start = (
+                        CuSeqLens[sequence_id[0]]
+                        + chunk_in_sequence[0] * _CHUNK_SIZE
+                    )
+                    valid_tokens = T.min(
+                        _CHUNK_SIZE,
+                        CuSeqLens[sequence_id[0] + 1] - chunk_start,
+                    )
 
                 q_shared = T.alloc_shared(
                     (_CHUNK_SIZE, _HEAD_DIM), T.bfloat16
