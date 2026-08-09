@@ -426,6 +426,14 @@ def _compile_persistent_recurrence(
                 ],
                 dt_bias,
             )
+            T.async_copy(
+                GRaw[
+                    sequence_start : sequence_start + _CHUNK_SIZE,
+                    head,
+                    0:_HEAD_DIM,
+                ],
+                x_shared,
+            )
 
             for chunk in T.serial(max_chunks_per_sequence):
                 if chunk * _CHUNK_SIZE < sequence_length:
@@ -443,6 +451,7 @@ def _compile_persistent_recurrence(
                         ],
                         k_shared,
                     )
+                    T.ptx_wait_group(1)
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
                     ):
@@ -452,7 +461,7 @@ def _compile_persistent_recurrence(
                             * T.sigmoid(
                                 a_scale[0]
                                 * (
-                                    GRaw[chunk_start + row, head, dim]
+                                    x_shared[row, dim]
                                     + dt_bias[dim % 4]
                                 )
                             ),
@@ -568,11 +577,7 @@ def _compile_persistent_recurrence(
                         out_fragment,
                         clear_accum=True,
                     )
-                    T.gemm(
-                        operator_shared,
-                        rhs_shared,
-                        out_fragment,
-                    )
+                    T.sync_threads()
 
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
@@ -598,6 +603,23 @@ def _compile_persistent_recurrence(
                         rhs_shared,
                         state_fragment,
                         transpose_A=True,
+                    )
+                    T.sync_threads()
+                    if (chunk + 1) * _CHUNK_SIZE < sequence_length:
+                        T.async_copy(
+                            GRaw[
+                                chunk_start
+                                + _CHUNK_SIZE : chunk_start
+                                + 2 * _CHUNK_SIZE,
+                                head,
+                                0:_HEAD_DIM,
+                            ],
+                            x_shared,
+                        )
+                    T.gemm(
+                        operator_shared,
+                        rhs_shared,
+                        out_fragment,
                     )
                     T.copy(out_fragment, rhs_shared)
                     for row, value in T.Parallel(
