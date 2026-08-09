@@ -817,9 +817,9 @@ def _compile_chunk_inter(total_tokens: int, num_sequences: int, num_heads: int):
                     _CHUNK_SIZE, _CHUNK_SIZE
                 ):
                     if row < valid_tokens:
-                        AInv[chunk_start + row, head, column] = operator_shared[
-                            row, column
-                        ]
+                        AInv[chunk_start + row, head, column] = (
+                            operator_shared[row, column] * beta[column]
+                        )
 
     return kernel
 
@@ -1646,7 +1646,6 @@ def _compile_transformed_state_scan(
                 (_CHUNK_SIZE, value_tile), T.bfloat16
             )
             decay_shared = T.alloc_shared((_HEAD_DIM,), T.float32)
-            beta = T.alloc_shared((_CHUNK_SIZE,), T.bfloat16)
 
             state_fragment = T.alloc_fragment(
                 (_HEAD_DIM, value_tile), T.float32
@@ -1720,12 +1719,6 @@ def _compile_transformed_state_scan(
                         ],
                         x_shared,
                     )
-                    for row in T.Parallel(_CHUNK_SIZE):
-                        beta[row] = T.if_then_else(
-                            row < valid_tokens,
-                            Beta[chunk_start + row, head],
-                            T.cast(0.0, T.bfloat16),
-                        )
                     for row, column in T.Parallel(
                         _CHUNK_SIZE, _CHUNK_SIZE
                     ):
@@ -1763,15 +1756,12 @@ def _compile_transformed_state_scan(
                     ):
                         rhs_fragment[row, value] = T.if_then_else(
                             row < valid_tokens,
-                            beta[row]
-                            * (
-                                V[
-                                    chunk_start + row,
-                                    head,
-                                    value_block * value_tile + value,
-                                ]
-                                - rhs_fragment[row, value]
-                            ),
+                            V[
+                                chunk_start + row,
+                                head,
+                                value_block * value_tile + value,
+                            ]
+                            - rhs_fragment[row, value],
                             0.0,
                         )
                     T.copy(rhs_fragment, rhs_shared)
