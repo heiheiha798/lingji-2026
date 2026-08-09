@@ -401,6 +401,7 @@ def _compile_persistent_recurrence(
             )
             a_scale = T.alloc_local((1,), T.float32)
             dt_bias = T.alloc_local((4,), T.float32)
+            gate_prefix = T.alloc_local((1,), T.float32)
 
             T.copy(
                 InitialState[
@@ -482,9 +483,11 @@ def _compile_persistent_recurrence(
                     T.sync_threads()
 
                     for dim in T.Parallel(_HEAD_DIM):
+                        gate_prefix[0] = g_shared[0, dim]
                         for row in T.serial(1, _CHUNK_SIZE):
                             if row < valid_tokens:
-                                g_shared[row, dim] += g_shared[row - 1, dim]
+                                gate_prefix[0] += g_shared[row, dim]
+                                g_shared[row, dim] = gate_prefix[0]
                     T.sync_threads()
 
                     for row, dim in T.Parallel(
