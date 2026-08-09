@@ -441,7 +441,7 @@ def _compile_persistent_recurrence(
                         k_shared[row, dim] = T.if_then_else(
                             row < valid_tokens,
                             K[chunk_start + row, head, dim],
-                            0.0,
+                            T.cast(0.0, T.bfloat16),
                         )
                         g_shared[row, dim] = T.if_then_else(
                             row < valid_tokens,
@@ -459,7 +459,7 @@ def _compile_persistent_recurrence(
                         beta[row] = T.if_then_else(
                             row < valid_tokens,
                             Beta[chunk_start + row, head],
-                            0.0,
+                            T.cast(0.0, T.bfloat16),
                         )
                         norm[row] = T.if_then_else(
                             row < valid_tokens,
@@ -487,7 +487,7 @@ def _compile_persistent_recurrence(
                         operator_shared[row, column] = T.if_then_else(
                             row < valid_tokens,
                             AInv[chunk_start + row, head, column],
-                            0.0,
+                            T.cast(0.0, T.bfloat16),
                         )
                     T.copy(state_fragment, state_shared)
                     T.sync_threads()
@@ -528,7 +528,7 @@ def _compile_persistent_recurrence(
                         x_shared[row, dim] = T.if_then_else(
                             row < valid_tokens,
                             Q[chunk_start + row, head, dim],
-                            0.0,
+                            T.cast(0.0, T.bfloat16),
                         )
                     for row in T.Parallel(_CHUNK_SIZE):
                         norm[row] = T.if_then_else(
@@ -554,7 +554,7 @@ def _compile_persistent_recurrence(
                         operator_shared[row, column] = T.if_then_else(
                             row < valid_tokens,
                             Aqk[chunk_start + row, head, column],
-                            0.0,
+                            T.cast(0.0, T.bfloat16),
                         )
                     T.sync_threads()
                     T.gemm(
