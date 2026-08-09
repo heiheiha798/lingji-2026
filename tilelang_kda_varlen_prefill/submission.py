@@ -113,35 +113,45 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                 gate_prefix = T.alloc_local(
                     (_HEAD_DIM // _OPERATOR_THREADS,), T.float32
                 )
+                gate_raw_rows = T.alloc_local((4, 4), T.bfloat16)
 
                 a_scale[0] = T.exp(ALog[head])
                 T.copy(
                     DtBias[head, thread * 4 : thread * 4 + 4],
                     dt_bias,
                 )
-                for row, dim in T.Parallel(_CHUNK_SIZE, _HEAD_DIM):
-                    q_shared[row, dim] = T.if_then_else(
-                        row < valid_tokens,
-                        Q[chunk_start + row, head, dim],
-                        T.cast(0.0, T.bfloat16),
-                    )
-                    k_shared[row, dim] = T.if_then_else(
-                        row < valid_tokens,
-                        K[chunk_start + row, head, dim],
-                        T.cast(0.0, T.bfloat16),
-                    )
-                    g_shared[row, dim] = T.if_then_else(
-                        row < valid_tokens,
-                        _LOG2_GATE_SCALE
-                        * T.sigmoid(
-                            a_scale[0]
-                            * (
-                                GRaw[chunk_start + row, head, dim]
-                                + dt_bias[dim % 4]
-                            )
-                        ),
-                        0.0,
-                    )
+                for row_group in T.serial(_CHUNK_SIZE // 4):
+                    for row_slot, dim in T.Parallel(4, _HEAD_DIM):
+                        row = row_group * 4 + row_slot
+                        q_shared[row, dim] = T.if_then_else(
+                            row < valid_tokens,
+                            Q[chunk_start + row, head, dim],
+                            T.cast(0.0, T.bfloat16),
+                        )
+                        k_shared[row, dim] = T.if_then_else(
+                            row < valid_tokens,
+                            K[chunk_start + row, head, dim],
+                            T.cast(0.0, T.bfloat16),
+                        )
+                        gate_raw_rows[row_slot, dim % 4] = T.if_then_else(
+                            row < valid_tokens,
+                            GRaw[chunk_start + row, head, dim],
+                            T.cast(0.0, T.bfloat16),
+                        )
+                    for row_slot, dim in T.Parallel(4, _HEAD_DIM):
+                        row = row_group * 4 + row_slot
+                        g_shared[row, dim] = T.if_then_else(
+                            row < valid_tokens,
+                            _LOG2_GATE_SCALE
+                            * T.sigmoid(
+                                a_scale[0]
+                                * (
+                                    gate_raw_rows[row_slot, dim % 4]
+                                    + dt_bias[dim % 4]
+                                )
+                            ),
+                            0.0,
+                        )
                 for row in T.Parallel(_CHUNK_SIZE):
                     beta[row] = T.if_then_else(
                         row < valid_tokens,
