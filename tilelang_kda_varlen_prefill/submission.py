@@ -1443,7 +1443,7 @@ def _compile_chunk_transform(
         SegmentRound: T.int32,
     ):
         with T.Kernel(
-            segment_chunks, num_heads, threads=_THREADS
+            segment_chunks, num_heads, threads=256
         ) as (segment_chunk, head):
             thread = T.get_thread_binding(0)
             sequence_id = T.alloc_local((1,), T.int32)
