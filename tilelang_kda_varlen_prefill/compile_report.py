@@ -14,8 +14,9 @@ from cuda_static_metrics import analyze_cuda_source
 from submission import (
     _compile_chunk_diagonal,
     _compile_chunk_inter,
-    _compile_chunk_output,
-    _compile_state_scan,
+    _compile_chunk_transform,
+    _compile_transformed_chunk_output,
+    _compile_transformed_state_scan,
 )
 from tilelang.env import env
 
@@ -62,6 +63,7 @@ def main() -> None:
             "preprocess",
             "diagonal",
             "inter",
+            "transform",
             "state",
             "output",
             "tail",
@@ -81,11 +83,11 @@ def main() -> None:
     args.artifacts_dir.mkdir(parents=True)
     env.disable_cache()
     if args.stage == "both":
-        stages = ("diagonal", "inter", "state", "output")
+        stages = ("diagonal", "inter", "transform", "state", "output")
     elif args.stage == "preprocess":
         stages = ("diagonal", "inter")
     elif args.stage == "tail":
-        stages = ("state", "output")
+        stages = ("transform", "state", "output")
     else:
         stages = (args.stage,)
 
@@ -112,10 +114,13 @@ def main() -> None:
         token_head_elements = total_tokens * num_heads
         max_chunks = (total_tokens + 63) // 64 + num_sequences - 1
         scratch_offset = 4 * operator_elements + 10 * token_head_elements
+        tail_chunk_bytes = num_heads * (
+            128 * 128 * 2 + 3 * 64 * 128 * 2 + 128 * 4
+        )
         segment_chunks = min(
             max_chunks,
             (spec.workspace_bytes - scratch_offset)
-            // (num_heads * 128 * 128 * 2),
+            // tail_chunk_bytes,
         )
         print(
             f"{case_name}: build T={total_tokens}, B={num_sequences}, "
@@ -132,8 +137,15 @@ def main() -> None:
             kernels["inter"] = _compile_chunk_inter(
                 total_tokens, num_sequences, num_heads
             )
+        if "transform" in stages:
+            kernels["transform"] = _compile_chunk_transform(
+                total_tokens,
+                num_sequences,
+                num_heads,
+                segment_chunks,
+            )
         if "state" in stages:
-            kernels["state"] = _compile_state_scan(
+            kernels["state"] = _compile_transformed_state_scan(
                 total_tokens,
                 num_sequences,
                 num_heads,
@@ -145,7 +157,7 @@ def main() -> None:
                 segment_chunks,
             )
         if "output" in stages:
-            kernels["output"] = _compile_chunk_output(
+            kernels["output"] = _compile_transformed_chunk_output(
                 total_tokens,
                 num_sequences,
                 num_heads,

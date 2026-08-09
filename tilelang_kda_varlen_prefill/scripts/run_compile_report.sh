@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if (( $# < 1 )); then
-    echo "usage: $0 EXPERIMENT_NAME [--stage preprocess|diagonal|inter|state|output|tail|both] [K1 K2 K3 K4]" >&2
+    echo "usage: $0 EXPERIMENT_NAME [--stage preprocess|diagonal|inter|transform|state|output|tail|both] [K1 K2 K3 K4]" >&2
     exit 2
 fi
 
@@ -15,13 +15,13 @@ fi
 stage=both
 if (( $# >= 1 )) && [[ $1 == --stage ]]; then
     if (( $# < 2 )); then
-        echo "--stage requires preprocess, diagonal, inter, state, output, tail, or both" >&2
+        echo "--stage requires preprocess, diagonal, inter, transform, state, output, tail, or both" >&2
         exit 2
     fi
     stage=$2
     shift 2
 fi
-if [[ $stage != preprocess && $stage != diagonal && $stage != inter && $stage != state && $stage != output && $stage != tail && $stage != both ]]; then
+if [[ $stage != preprocess && $stage != diagonal && $stage != inter && $stage != transform && $stage != state && $stage != output && $stage != tail && $stage != both ]]; then
     echo "invalid stage: $stage" >&2
     exit 2
 fi
