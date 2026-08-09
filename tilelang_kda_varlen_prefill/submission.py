@@ -518,6 +518,14 @@ def _compile_persistent_recurrence(
                             0.0,
                         )
                     T.copy(rhs_fragment, rhs_shared)
+                    T.async_copy(
+                        Q[
+                            chunk_start : chunk_start + _CHUNK_SIZE,
+                            head,
+                            0:_HEAD_DIM,
+                        ],
+                        x_shared,
+                    )
                     T.gemm(
                         operator_shared,
                         rhs_shared,
@@ -526,20 +534,13 @@ def _compile_persistent_recurrence(
                     )
                     T.copy(rhs_fragment, rhs_shared)
 
-                    for row, dim in T.Parallel(
-                        _CHUNK_SIZE, _HEAD_DIM
-                    ):
-                        x_shared[row, dim] = T.if_then_else(
-                            row < valid_tokens,
-                            Q[chunk_start + row, head, dim],
-                            T.cast(0.0, T.bfloat16),
-                        )
                     for row in T.Parallel(_CHUNK_SIZE):
                         norm[row] = T.if_then_else(
                             row < valid_tokens,
                             Norm[chunk_start + row, head, 0],
                             0.0,
                         )
+                    T.ptx_wait_group(0)
                     T.sync_threads()
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
