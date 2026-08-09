@@ -435,14 +435,17 @@ def _compile_persistent_recurrence(
                         sequence_length - chunk * _CHUNK_SIZE,
                     )
 
+                    T.async_copy(
+                        K[
+                            chunk_start : chunk_start + _CHUNK_SIZE,
+                            head,
+                            0:_HEAD_DIM,
+                        ],
+                        k_shared,
+                    )
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
                     ):
-                        k_shared[row, dim] = T.if_then_else(
-                            row < valid_tokens,
-                            K[chunk_start + row, head, dim],
-                            T.cast(0.0, T.bfloat16),
-                        )
                         g_shared[row, dim] = T.if_then_else(
                             row < valid_tokens,
                             _LOG2_GATE_SCALE
@@ -466,6 +469,7 @@ def _compile_persistent_recurrence(
                             Norm[chunk_start + row, head, 1],
                             0.0,
                         )
+                    T.ptx_wait_group(0)
                     T.sync_threads()
 
                     for dim in T.Parallel(_HEAD_DIM):
