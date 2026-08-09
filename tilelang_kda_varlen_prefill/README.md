@@ -222,8 +222,8 @@ python benchmark.py --mode bench --case performance --json-out benchmark.json
 # 公开性能用例的本地测试
 python benchmark.py --mode bench --case official --preset official --device cuda --json-out benchmark.json
 
-# 只为本轮改动的 persistent kernel 生成 K3 编译与反汇编报告
-./scripts/run_compile_report.sh candidate-name --stage persistent K3
+# 只为本轮改动的 state/output tail 生成 K3 编译与反汇编报告
+./scripts/run_compile_report.sh candidate-name --stage tail K3
 ```
 
 `--compile-workers N` 只并行预热不同 `(T, B, H)` 的 TileLang 磁盘 cache；正确性检查和性能测量仍按 case 串行执行。相同源码和静态 shape 的后续进程会直接加载 cache，不再重新 lowering。

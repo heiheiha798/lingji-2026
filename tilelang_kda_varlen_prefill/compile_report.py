@@ -14,7 +14,8 @@ from cuda_static_metrics import analyze_cuda_source
 from submission import (
     _compile_chunk_diagonal,
     _compile_chunk_inter,
-    _compile_persistent_recurrence,
+    _compile_chunk_output,
+    _compile_state_scan,
 )
 from tilelang.env import env
 
@@ -57,7 +58,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--stage",
-        choices=("preprocess", "diagonal", "inter", "persistent", "both"),
+        choices=(
+            "preprocess",
+            "diagonal",
+            "inter",
+            "state",
+            "output",
+            "tail",
+            "both",
+        ),
         default="both",
     )
     parser.add_argument("--output", type=Path, required=True)
@@ -72,9 +81,11 @@ def main() -> None:
     args.artifacts_dir.mkdir(parents=True)
     env.disable_cache()
     if args.stage == "both":
-        stages = ("diagonal", "inter", "persistent")
+        stages = ("diagonal", "inter", "state", "output")
     elif args.stage == "preprocess":
         stages = ("diagonal", "inter")
+    elif args.stage == "tail":
+        stages = ("state", "output")
     else:
         stages = (args.stage,)
 
@@ -97,9 +108,18 @@ def main() -> None:
             num_sequences=num_sequences,
             num_heads=num_heads,
         )
+        operator_elements = total_tokens * num_heads * 64
+        token_head_elements = total_tokens * num_heads
+        max_chunks = (total_tokens + 63) // 64 + num_sequences - 1
+        scratch_offset = 4 * operator_elements + 10 * token_head_elements
+        segment_chunks = min(
+            max_chunks,
+            (spec.workspace_bytes - scratch_offset)
+            // (num_heads * 128 * 128 * 2),
+        )
         print(
             f"{case_name}: build T={total_tokens}, B={num_sequences}, "
-            f"H={num_heads}",
+            f"H={num_heads}, segment_chunks={segment_chunks}",
             flush=True,
         )
         started = time.perf_counter()
@@ -112,8 +132,8 @@ def main() -> None:
             kernels["inter"] = _compile_chunk_inter(
                 total_tokens, num_sequences, num_heads
             )
-        if "persistent" in stages:
-            kernels["persistent"] = _compile_persistent_recurrence(
+        if "state" in stages:
+            kernels["state"] = _compile_state_scan(
                 total_tokens,
                 num_sequences,
                 num_heads,
@@ -122,6 +142,14 @@ def main() -> None:
                     if num_sequences * num_heads >= 64
                     else (16 if num_sequences * num_heads < 32 else 32)
                 ),
+                segment_chunks,
+            )
+        if "output" in stages:
+            kernels["output"] = _compile_chunk_output(
+                total_tokens,
+                num_sequences,
+                num_heads,
+                segment_chunks,
             )
         build_seconds = time.perf_counter() - started
 
@@ -130,6 +158,10 @@ def main() -> None:
             "total_tokens": total_tokens,
             "num_sequences": num_sequences,
             "num_heads": num_heads,
+            "max_chunks": max_chunks,
+            "segment_chunks": segment_chunks,
+            "segments": (max_chunks + segment_chunks - 1) // segment_chunks,
+            "scratch_offset_bytes": scratch_offset,
             "build_seconds": round(build_seconds, 3),
         }
         for stage in stages:

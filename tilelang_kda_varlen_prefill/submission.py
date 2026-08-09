@@ -829,16 +829,13 @@ def _compile_chunk_inter(total_tokens: int, num_sequences: int, num_heads: int):
     target=_TARGET,
     pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
 )
-def _compile_persistent_recurrence(
+def _compile_state_scan(
     total_tokens: int,
     num_sequences: int,
     num_heads: int,
     value_tile: int,
+    segment_chunks: int,
 ):
-    max_chunks_per_sequence = (
-        total_tokens + _CHUNK_SIZE - 1
-    ) // _CHUNK_SIZE
-
     token_shape = (total_tokens, num_heads, _HEAD_DIM)
     beta_shape = (total_tokens, num_heads)
     a_log_shape = (num_heads,)
@@ -852,10 +849,15 @@ def _compile_persistent_recurrence(
     cu_shape = (num_sequences + 1,)
     operator_shape = (total_tokens, num_heads, _CHUNK_SIZE)
     norm_shape = (total_tokens, num_heads, 2)
+    scratch_shape = (
+        segment_chunks,
+        num_heads,
+        _HEAD_DIM,
+        _HEAD_DIM,
+    )
 
     @T.prim_func
     def kernel(
-        Q: T.Tensor(token_shape, T.bfloat16),
         K: T.Tensor(token_shape, T.bfloat16),
         V: T.Tensor(token_shape, T.bfloat16),
         GRaw: T.Tensor(token_shape, T.bfloat16),
@@ -864,11 +866,12 @@ def _compile_persistent_recurrence(
         InitialState: T.Tensor(state_shape, T.bfloat16),
         CuSeqLens: T.Tensor(cu_shape, T.int32),
         AInv: T.Tensor(operator_shape, T.bfloat16),
-        Aqk: T.Tensor(operator_shape, T.bfloat16),
         Norm: T.Tensor(norm_shape, T.float32),
         Beta: T.Tensor(beta_shape, T.bfloat16),
-        Out: T.Tensor(token_shape, T.bfloat16),
+        StateScratch: T.Tensor(scratch_shape, T.bfloat16),
+        VNew: T.Tensor(token_shape, T.bfloat16),
         FinalState: T.Tensor(state_shape, T.bfloat16),
+        SegmentStart: T.int32,
     ):
         with T.Kernel(
             T.ceildiv(_HEAD_DIM, value_tile),
@@ -904,28 +907,32 @@ def _compile_persistent_recurrence(
             rhs_fragment = T.alloc_fragment(
                 (_CHUNK_SIZE, value_tile), T.float32
             )
-            out_fragment = T.alloc_fragment(
-                (_CHUNK_SIZE, value_tile), T.float32
-            )
             a_scale = T.alloc_local((1,), T.float32)
             dt_bias = T.alloc_local((4,), T.float32)
             gate_prefix = T.alloc_local((1,), T.float32)
             normalized_k = T.alloc_local((4,), T.bfloat16)
-
-            T.copy(
-                InitialState[
-                    sequence,
-                    head,
-                    0:_HEAD_DIM,
-                    value_block
-                    * value_tile : (value_block + 1)
-                    * value_tile,
-                ],
-                state_fragment,
-            )
+            chunk_prefix = T.alloc_local((1,), T.int32)
+            first_chunk = T.alloc_local((1,), T.int32)
+            last_chunk = T.alloc_local((1,), T.int32)
 
             sequence_start = CuSeqLens[sequence]
             sequence_length = CuSeqLens[sequence + 1] - sequence_start
+            sequence_chunks = T.ceildiv(sequence_length, _CHUNK_SIZE)
+            chunk_prefix[0] = 0
+            for prior_sequence in T.serial(num_sequences):
+                if prior_sequence < sequence:
+                    chunk_prefix[0] += T.ceildiv(
+                        CuSeqLens[prior_sequence + 1]
+                        - CuSeqLens[prior_sequence],
+                        _CHUNK_SIZE,
+                    )
+            first_chunk[0] = T.max(
+                0, SegmentStart - chunk_prefix[0]
+            )
+            last_chunk[0] = T.min(
+                sequence_chunks,
+                SegmentStart + segment_chunks - chunk_prefix[0],
+            )
             a_scale[0] = T.exp(ALog[head])
             T.copy(
                 DtBias[
@@ -936,17 +943,45 @@ def _compile_persistent_recurrence(
                 ],
                 dt_bias,
             )
-            T.async_copy(
-                GRaw[
-                    sequence_start : sequence_start + _CHUNK_SIZE,
-                    head,
-                    0:_HEAD_DIM,
-                ],
-                x_shared,
-            )
+            if first_chunk[0] < last_chunk[0]:
+                if first_chunk[0] == 0:
+                    T.copy(
+                        InitialState[
+                            sequence,
+                            head,
+                            0:_HEAD_DIM,
+                            value_block
+                            * value_tile : (value_block + 1)
+                            * value_tile,
+                        ],
+                        state_fragment,
+                    )
+                else:
+                    T.copy(
+                        FinalState[
+                            sequence,
+                            head,
+                            0:_HEAD_DIM,
+                            value_block
+                            * value_tile : (value_block + 1)
+                            * value_tile,
+                        ],
+                        state_fragment,
+                    )
+                T.async_copy(
+                    GRaw[
+                        sequence_start
+                        + first_chunk[0]
+                        * _CHUNK_SIZE : sequence_start
+                        + (first_chunk[0] + 1)
+                        * _CHUNK_SIZE,
+                        head,
+                        0:_HEAD_DIM,
+                    ],
+                    x_shared,
+                )
 
-            for chunk in T.serial(max_chunks_per_sequence):
-                if chunk * _CHUNK_SIZE < sequence_length:
+                for chunk in T.serial(first_chunk[0], last_chunk[0]):
                     chunk_start = sequence_start + chunk * _CHUNK_SIZE
                     valid_tokens = T.min(
                         _CHUNK_SIZE,
@@ -1018,6 +1053,17 @@ def _compile_persistent_recurrence(
                             T.cast(0.0, T.bfloat16),
                         )
                     T.copy(state_fragment, state_shared)
+                    T.copy(
+                        state_shared,
+                        StateScratch[
+                            chunk_prefix[0] + chunk - SegmentStart,
+                            head,
+                            0:_HEAD_DIM,
+                            value_block
+                            * value_tile : (value_block + 1)
+                            * value_tile,
+                        ],
+                    )
                     T.sync_threads()
                     T.gemm(
                         x_shared,
@@ -1042,14 +1088,6 @@ def _compile_persistent_recurrence(
                             0.0,
                         )
                     T.copy(rhs_fragment, rhs_shared)
-                    T.async_copy(
-                        Q[
-                            chunk_start : chunk_start + _CHUNK_SIZE,
-                            head,
-                            0:_HEAD_DIM,
-                        ],
-                        x_shared,
-                    )
                     T.gemm(
                         operator_shared,
                         rhs_shared,
@@ -1057,42 +1095,6 @@ def _compile_persistent_recurrence(
                         clear_accum=True,
                     )
                     T.copy(rhs_fragment, rhs_shared)
-
-                    for row in T.Parallel(_CHUNK_SIZE):
-                        norm[row] = T.if_then_else(
-                            row < valid_tokens,
-                            Norm[chunk_start + row, head, 0],
-                            0.0,
-                        )
-                    T.ptx_wait_group(0)
-                    T.sync_threads()
-                    for row, dim in T.Parallel(
-                        _CHUNK_SIZE, _HEAD_DIM
-                    ):
-                        x_shared[row, dim] = T.if_then_else(
-                            row < valid_tokens,
-                            x_shared[row, dim]
-                            * norm[row]
-                            * T.exp2(g_shared[row, dim])
-                            * _INV_SQRT_HEAD_DIM,
-                            0.0,
-                        )
-                    for row, column in T.Parallel(
-                        _CHUNK_SIZE, _CHUNK_SIZE
-                    ):
-                        operator_shared[row, column] = T.if_then_else(
-                            row < valid_tokens,
-                            Aqk[chunk_start + row, head, column],
-                            T.cast(0.0, T.bfloat16),
-                        )
-                    T.sync_threads()
-                    T.gemm(
-                        x_shared,
-                        state_shared,
-                        out_fragment,
-                        clear_accum=True,
-                    )
-                    T.sync_threads()
 
                     for row, dim in T.Parallel(
                         _CHUNK_SIZE, _HEAD_DIM
@@ -1119,46 +1121,258 @@ def _compile_persistent_recurrence(
                         state_fragment,
                         transpose_A=True,
                     )
-                    T.sync_threads()
-                    if (chunk + 1) * _CHUNK_SIZE < sequence_length:
+                    if chunk + 1 < last_chunk[0]:
                         T.async_copy(
                             GRaw[
-                                chunk_start
-                                + _CHUNK_SIZE : chunk_start
+                                chunk_start + _CHUNK_SIZE : chunk_start
                                 + 2 * _CHUNK_SIZE,
                                 head,
                                 0:_HEAD_DIM,
                             ],
                             x_shared,
                         )
-                    T.gemm(
-                        operator_shared,
-                        rhs_shared,
-                        out_fragment,
-                    )
-                    T.copy(out_fragment, rhs_shared)
                     for row, value in T.Parallel(
                         _CHUNK_SIZE, value_tile
                     ):
                         if row < valid_tokens:
-                            Out[
+                            VNew[
                                 chunk_start + row,
                                 head,
                                 value_block * value_tile + value,
                             ] = rhs_shared[row, value]
+                T.copy(state_fragment, state_shared)
+                T.copy(
+                    state_shared,
+                    FinalState[
+                        sequence,
+                        head,
+                        0:_HEAD_DIM,
+                        value_block
+                        * value_tile : (value_block + 1)
+                        * value_tile,
+                    ],
+                )
 
-            T.copy(state_fragment, state_shared)
-            T.copy(
-                state_shared,
-                FinalState[
-                    sequence,
-                    head,
-                    0:_HEAD_DIM,
-                    value_block
-                    * value_tile : (value_block + 1)
-                    * value_tile,
-                ],
-            )
+    return kernel
+
+
+@tilelang.jit(
+    out_idx=[],
+    target=_TARGET,
+    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+)
+def _compile_chunk_output(
+    total_tokens: int,
+    num_sequences: int,
+    num_heads: int,
+    segment_chunks: int,
+):
+    value_tile = 64
+    token_shape = (total_tokens, num_heads, _HEAD_DIM)
+    a_log_shape = (num_heads,)
+    dt_bias_shape = (num_heads, _HEAD_DIM)
+    cu_shape = (num_sequences + 1,)
+    operator_shape = (total_tokens, num_heads, _CHUNK_SIZE)
+    norm_shape = (total_tokens, num_heads, 2)
+    scratch_shape = (
+        segment_chunks,
+        num_heads,
+        _HEAD_DIM,
+        _HEAD_DIM,
+    )
+
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor(token_shape, T.bfloat16),
+        GRaw: T.Tensor(token_shape, T.bfloat16),
+        ALog: T.Tensor(a_log_shape, T.float32),
+        DtBias: T.Tensor(dt_bias_shape, T.float32),
+        CuSeqLens: T.Tensor(cu_shape, T.int32),
+        Aqk: T.Tensor(operator_shape, T.bfloat16),
+        Norm: T.Tensor(norm_shape, T.float32),
+        StateScratch: T.Tensor(scratch_shape, T.bfloat16),
+        VNewOut: T.Tensor(token_shape, T.bfloat16),
+        SegmentStart: T.int32,
+    ):
+        with T.Kernel(
+            segment_chunks,
+            T.ceildiv(_HEAD_DIM, value_tile),
+            num_heads,
+            threads=_THREADS,
+        ) as (segment_chunk, value_block, head):
+            thread = T.get_thread_binding(0)
+            chunk_id = segment_chunk + SegmentStart
+            sequence_id = T.alloc_local((1,), T.int32)
+            chunk_in_sequence = T.alloc_local((1,), T.int32)
+            chunk_prefix = T.alloc_local((1,), T.int32)
+
+            sequence_id[0] = -1
+            chunk_in_sequence[0] = 0
+            chunk_prefix[0] = 0
+            for sequence in T.serial(num_sequences):
+                sequence_chunks = T.ceildiv(
+                    CuSeqLens[sequence + 1] - CuSeqLens[sequence],
+                    _CHUNK_SIZE,
+                )
+                if (
+                    chunk_id >= chunk_prefix[0]
+                    and chunk_id < chunk_prefix[0] + sequence_chunks
+                ):
+                    sequence_id[0] = sequence
+                    chunk_in_sequence[0] = chunk_id - chunk_prefix[0]
+                chunk_prefix[0] += sequence_chunks
+
+            if sequence_id[0] >= 0:
+                chunk_start = (
+                    CuSeqLens[sequence_id[0]]
+                    + chunk_in_sequence[0] * _CHUNK_SIZE
+                )
+                valid_tokens = T.min(
+                    _CHUNK_SIZE,
+                    CuSeqLens[sequence_id[0] + 1] - chunk_start,
+                )
+                q_shared = T.alloc_shared(
+                    (_CHUNK_SIZE, _HEAD_DIM), T.bfloat16
+                )
+                g_shared = T.alloc_shared(
+                    (_CHUNK_SIZE, _HEAD_DIM), T.float32
+                )
+                operator_shared = T.alloc_shared(
+                    (_CHUNK_SIZE, _CHUNK_SIZE), T.bfloat16
+                )
+                state_shared = T.alloc_shared(
+                    (_HEAD_DIM, value_tile), T.bfloat16
+                )
+                rhs_shared = T.alloc_shared(
+                    (_CHUNK_SIZE, value_tile), T.bfloat16
+                )
+                norm = T.alloc_shared((_CHUNK_SIZE,), T.float32)
+                out_fragment = T.alloc_fragment(
+                    (_CHUNK_SIZE, value_tile), T.float32
+                )
+                a_scale = T.alloc_local((1,), T.float32)
+                dt_bias = T.alloc_local((4,), T.float32)
+                gate_prefix = T.alloc_local((1,), T.float32)
+
+                a_scale[0] = T.exp(ALog[head])
+                T.copy(
+                    DtBias[
+                        head,
+                        (thread % _WARP_SIZE)
+                        * 4 : (thread % _WARP_SIZE) * 4
+                        + 4,
+                    ],
+                    dt_bias,
+                )
+                T.async_copy(
+                    GRaw[
+                        chunk_start : chunk_start + _CHUNK_SIZE,
+                        head,
+                        0:_HEAD_DIM,
+                    ],
+                    q_shared,
+                )
+                T.ptx_wait_group(0)
+                T.sync_threads()
+                for row, dim in T.Parallel(
+                    _CHUNK_SIZE, _HEAD_DIM
+                ):
+                    g_shared[row, dim] = T.if_then_else(
+                        row < valid_tokens,
+                        _LOG2_GATE_SCALE
+                        * T.sigmoid(
+                            a_scale[0]
+                            * (
+                                q_shared[row, dim]
+                                + dt_bias[dim % 4]
+                            )
+                        ),
+                        0.0,
+                    )
+                T.sync_threads()
+                for dim in T.Parallel(_HEAD_DIM):
+                    gate_prefix[0] = g_shared[0, dim]
+                    for row in T.serial(1, _CHUNK_SIZE):
+                        gate_prefix[0] += g_shared[row, dim]
+                        g_shared[row, dim] = gate_prefix[0]
+                T.async_copy(
+                    Q[
+                        chunk_start : chunk_start + _CHUNK_SIZE,
+                        head,
+                        0:_HEAD_DIM,
+                    ],
+                    q_shared,
+                )
+                for row in T.Parallel(_CHUNK_SIZE):
+                    norm[row] = T.if_then_else(
+                        row < valid_tokens,
+                        Norm[chunk_start + row, head, 0],
+                        0.0,
+                    )
+                for row, column in T.Parallel(
+                    _CHUNK_SIZE, _CHUNK_SIZE
+                ):
+                    operator_shared[row, column] = T.if_then_else(
+                        row < valid_tokens,
+                        Aqk[chunk_start + row, head, column],
+                        T.cast(0.0, T.bfloat16),
+                    )
+                T.copy(
+                    StateScratch[
+                        segment_chunk,
+                        head,
+                        0:_HEAD_DIM,
+                        value_block
+                        * value_tile : (value_block + 1)
+                        * value_tile,
+                    ],
+                    state_shared,
+                )
+                T.copy(
+                    VNewOut[
+                        chunk_start : chunk_start + _CHUNK_SIZE,
+                        head,
+                        value_block
+                        * value_tile : (value_block + 1)
+                        * value_tile,
+                    ],
+                    rhs_shared,
+                )
+                T.ptx_wait_group(0)
+                T.sync_threads()
+                for row, dim in T.Parallel(
+                    _CHUNK_SIZE, _HEAD_DIM
+                ):
+                    q_shared[row, dim] = T.if_then_else(
+                        row < valid_tokens,
+                        q_shared[row, dim]
+                        * norm[row]
+                        * T.exp2(g_shared[row, dim])
+                        * _INV_SQRT_HEAD_DIM,
+                        T.cast(0.0, T.bfloat16),
+                    )
+                T.sync_threads()
+                T.gemm(
+                    q_shared,
+                    state_shared,
+                    out_fragment,
+                    clear_accum=True,
+                )
+                T.gemm(
+                    operator_shared,
+                    rhs_shared,
+                    out_fragment,
+                )
+                T.copy(out_fragment, rhs_shared)
+                for row, value in T.Parallel(
+                    _CHUNK_SIZE, value_tile
+                ):
+                    if row < valid_tokens:
+                        VNewOut[
+                            chunk_start + row,
+                            head,
+                            value_block * value_tile + value,
+                        ] = rhs_shared[row, value]
 
     return kernel
 
@@ -1169,6 +1383,21 @@ class Submission:
         num_sequences = int(spec.num_sequences)
         num_heads = int(spec.num_heads)
         operator_elements = total_tokens * num_heads * _CHUNK_SIZE
+        token_head_elements = total_tokens * num_heads
+        max_chunks = (
+            (total_tokens + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+            + num_sequences
+            - 1
+        )
+        scratch_offset = 4 * operator_elements + 10 * token_head_elements
+        state_chunk_bytes = num_heads * _HEAD_DIM * _HEAD_DIM * 2
+        segment_chunks = min(
+            max_chunks,
+            (int(spec.workspace_bytes) - scratch_offset)
+            // state_chunk_bytes,
+        )
+        if segment_chunks <= 0:
+            raise ValueError("workspace cannot hold one compact chunk state")
 
         chunk_diagonal = _compile_chunk_diagonal(
             total_tokens, num_sequences, num_heads
@@ -1176,7 +1405,7 @@ class Submission:
         chunk_inter = _compile_chunk_inter(
             total_tokens, num_sequences, num_heads
         )
-        persistent_recurrence = _compile_persistent_recurrence(
+        state_scan = _compile_state_scan(
             total_tokens,
             num_sequences,
             num_heads,
@@ -1185,12 +1414,23 @@ class Submission:
                 if num_sequences * num_heads >= 64
                 else (16 if num_sequences * num_heads < 32 else 32)
             ),
+            segment_chunks,
+        )
+        chunk_output = _compile_chunk_output(
+            total_tokens,
+            num_sequences,
+            num_heads,
+            segment_chunks,
         )
         return (
             chunk_diagonal,
             chunk_inter,
-            persistent_recurrence,
+            state_scan,
+            chunk_output,
             operator_elements,
+            scratch_offset,
+            segment_chunks,
+            max_chunks,
         )
 
     @torch.no_grad()
@@ -1213,8 +1453,12 @@ class Submission:
         (
             chunk_diagonal,
             chunk_inter,
-            persistent_recurrence,
+            state_scan,
+            chunk_output,
             operator_elements,
+            scratch_offset,
+            segment_chunks,
+            max_chunks,
         ) = state
         workspace_bf16 = workspace.view(torch.bfloat16)
         ainv_diagonal = workspace[: 2 * operator_elements].view(
@@ -1236,6 +1480,15 @@ class Submission:
             + 8 * token_head_elements : norm_offset
             + 10 * token_head_elements
         ].view(torch.bfloat16).view(q.shape[0], q.shape[1])
+        state_scratch = workspace[
+            scratch_offset : scratch_offset
+            + 2 * segment_chunks * q.shape[1] * _HEAD_DIM * _HEAD_DIM
+        ].view(torch.bfloat16).view(
+            segment_chunks,
+            q.shape[1],
+            _HEAD_DIM,
+            _HEAD_DIM,
+        )
 
         chunk_diagonal(
             q,
@@ -1263,19 +1516,32 @@ class Submission:
             norm,
             beta,
         )
-        persistent_recurrence(
-            q,
-            k,
-            v,
-            g_raw,
-            a_log,
-            dt_bias,
-            initial_state,
-            cu_seqlens,
-            ainv,
-            aqk,
-            norm,
-            beta,
-            out,
-            final_state,
-        )
+        for segment_start in range(0, max_chunks, segment_chunks):
+            state_scan(
+                k,
+                v,
+                g_raw,
+                a_log,
+                dt_bias,
+                initial_state,
+                cu_seqlens,
+                ainv,
+                norm,
+                beta,
+                state_scratch,
+                out,
+                final_state,
+                segment_start,
+            )
+            chunk_output(
+                q,
+                g_raw,
+                a_log,
+                dt_bias,
+                cu_seqlens,
+                aqk,
+                norm,
+                state_scratch,
+                out,
+                segment_start,
+            )
