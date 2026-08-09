@@ -108,6 +108,8 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                 )
                 inverse_accumulator = T.alloc_local((2,), T.float32)
                 inverse_coefficient = T.alloc_local((1,), T.float32)
+                q_norm_partial = T.alloc_local((1,), T.float32)
+                k_norm_partial = T.alloc_local((1,), T.float32)
 
                 a_scale[0] = T.exp(ALog[head])
                 T.copy(
@@ -153,23 +155,29 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                             g_shared[row, dim] += g_shared[row - 1, dim]
                 T.sync_threads()
 
-                for row in T.Parallel(_CHUNK_SIZE):
-                    q_norm[row] = 1.0e-6
-                    k_norm[row] = 1.0e-6
-                    for dim in T.serial(_HEAD_DIM):
-                        q_norm[row] += (
+                for row in T.serial(_CHUNK_SIZE):
+                    q_norm_partial[0] = 0.0
+                    k_norm_partial[0] = 0.0
+                    for dim_slot in T.serial(_HEAD_DIM // _OPERATOR_THREADS):
+                        dim = dim_slot * _OPERATOR_THREADS + thread
+                        q_norm_partial[0] += (
                             T.cast(q_shared[row, dim], T.float32)
                             * T.cast(q_shared[row, dim], T.float32)
                         )
-                        k_norm[row] += (
+                        k_norm_partial[0] += (
                             T.cast(k_shared[row, dim], T.float32)
                             * T.cast(k_shared[row, dim], T.float32)
                         )
-                    q_norm[row] = T.rsqrt(q_norm[row])
-                    k_norm[row] = T.rsqrt(k_norm[row])
-                    if row < valid_tokens:
-                        Norm[chunk_start + row, head, 0] = q_norm[row]
-                        Norm[chunk_start + row, head, 1] = k_norm[row]
+                    q_norm_partial[0] = T.warp_reduce_sum(q_norm_partial[0])
+                    k_norm_partial[0] = T.warp_reduce_sum(k_norm_partial[0])
+                    q_norm_partial[0] = T.rsqrt(q_norm_partial[0] + 1.0e-6)
+                    k_norm_partial[0] = T.rsqrt(k_norm_partial[0] + 1.0e-6)
+                    if thread == 0:
+                        q_norm[row] = q_norm_partial[0]
+                        k_norm[row] = k_norm_partial[0]
+                        if row < valid_tokens:
+                            Norm[chunk_start + row, head, 0] = q_norm_partial[0]
+                            Norm[chunk_start + row, head, 1] = k_norm_partial[0]
                 T.sync_threads()
 
                 T.clear(aqk_shared)
