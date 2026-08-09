@@ -1575,14 +1575,15 @@ def _compile_chunk_transform(
                     ],
                     q_shared,
                 )
-                T.async_copy(
-                    K[
-                        chunk_start : chunk_start + _CHUNK_SIZE,
-                        head,
-                        0:_HEAD_DIM,
-                    ],
-                    k_shared,
-                )
+                if num_sequences == 1:
+                    T.async_copy(
+                        K[
+                            chunk_start : chunk_start + _CHUNK_SIZE,
+                            head,
+                            0:_HEAD_DIM,
+                        ],
+                        k_shared,
+                    )
                 for row in T.Parallel(_CHUNK_SIZE):
                     q_norm[row] = T.if_then_else(
                         row < valid_tokens,
@@ -1596,37 +1597,89 @@ def _compile_chunk_transform(
                     )
                 T.ptx_wait_group(0)
                 T.sync_threads()
-                for row, dim in T.Parallel(
-                    _CHUNK_SIZE, _HEAD_DIM
-                ):
-                    if row < valid_tokens:
-                        normalized_k[0] = k_shared[row, dim] * k_norm[row]
-                        QG[segment_chunk, head, row, dim] = (
+                if num_sequences == 1:
+                    for row, dim in T.Parallel(
+                        _CHUNK_SIZE, _HEAD_DIM
+                    ):
+                        if row < valid_tokens:
+                            normalized_k[0] = (
+                                k_shared[row, dim] * k_norm[row]
+                            )
+                            QG[segment_chunk, head, row, dim] = (
+                                q_shared[row, dim]
+                                * q_norm[row]
+                                * T.exp2(g_shared[row, dim])
+                                * _INV_SQRT_HEAD_DIM
+                            )
+                            KForward[segment_chunk, head, row, dim] = (
+                                normalized_k[0]
+                                * T.exp2(g_shared[row, dim])
+                            )
+                            KUpdate[segment_chunk, head, row, dim] = (
+                                normalized_k[0]
+                                * T.exp2(
+                                    g_shared[valid_tokens - 1, dim]
+                                    - g_shared[row, dim]
+                                )
+                            )
+                        else:
+                            QG[segment_chunk, head, row, dim] = T.cast(
+                                0.0, T.bfloat16
+                            )
+                            KForward[segment_chunk, head, row, dim] = T.cast(
+                                0.0, T.bfloat16
+                            )
+                            KUpdate[segment_chunk, head, row, dim] = T.cast(
+                                0.0, T.bfloat16
+                            )
+                else:
+                    for row, dim in T.Parallel(
+                        _CHUNK_SIZE, _HEAD_DIM
+                    ):
+                        QG[segment_chunk, head, row, dim] = T.if_then_else(
+                            row < valid_tokens,
                             q_shared[row, dim]
                             * q_norm[row]
                             * T.exp2(g_shared[row, dim])
-                            * _INV_SQRT_HEAD_DIM
+                            * _INV_SQRT_HEAD_DIM,
+                            T.cast(0.0, T.bfloat16),
                         )
-                        KForward[segment_chunk, head, row, dim] = (
-                            normalized_k[0] * T.exp2(g_shared[row, dim])
-                        )
-                        KUpdate[segment_chunk, head, row, dim] = (
-                            normalized_k[0]
-                            * T.exp2(
-                                g_shared[valid_tokens - 1, dim]
-                                - g_shared[row, dim]
+                    T.sync_threads()
+                    T.async_copy(
+                        K[
+                            chunk_start : chunk_start + _CHUNK_SIZE,
+                            head,
+                            0:_HEAD_DIM,
+                        ],
+                        q_shared,
+                    )
+                    T.ptx_wait_group(0)
+                    T.sync_threads()
+                    for row, dim in T.Parallel(
+                        _CHUNK_SIZE, _HEAD_DIM
+                    ):
+                        if row < valid_tokens:
+                            normalized_k[0] = (
+                                q_shared[row, dim] * k_norm[row]
                             )
-                        )
-                    else:
-                        QG[segment_chunk, head, row, dim] = T.cast(
-                            0.0, T.bfloat16
-                        )
-                        KForward[segment_chunk, head, row, dim] = T.cast(
-                            0.0, T.bfloat16
-                        )
-                        KUpdate[segment_chunk, head, row, dim] = T.cast(
-                            0.0, T.bfloat16
-                        )
+                            KForward[segment_chunk, head, row, dim] = (
+                                normalized_k[0]
+                                * T.exp2(g_shared[row, dim])
+                            )
+                            KUpdate[segment_chunk, head, row, dim] = (
+                                normalized_k[0]
+                                * T.exp2(
+                                    g_shared[valid_tokens - 1, dim]
+                                    - g_shared[row, dim]
+                                )
+                            )
+                        else:
+                            KForward[segment_chunk, head, row, dim] = T.cast(
+                                0.0, T.bfloat16
+                            )
+                            KUpdate[segment_chunk, head, row, dim] = T.cast(
+                                0.0, T.bfloat16
+                            )
 
     return kernel
 
