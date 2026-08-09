@@ -110,6 +110,9 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                 inverse_coefficient = T.alloc_local((1,), T.float32)
                 q_norm_partial = T.alloc_local((1,), T.float32)
                 k_norm_partial = T.alloc_local((1,), T.float32)
+                gate_prefix = T.alloc_local(
+                    (_HEAD_DIM // _OPERATOR_THREADS,), T.float32
+                )
 
                 a_scale[0] = T.exp(ALog[head])
                 T.copy(
@@ -149,10 +152,14 @@ def _compile_chunk_operators(total_tokens: int, num_sequences: int, num_heads: i
                         Beta[chunk_start + row, head] = beta[row]
                 T.sync_threads()
 
-                for dim in T.Parallel(_HEAD_DIM):
-                    for row in T.serial(1, _CHUNK_SIZE):
-                        if row < valid_tokens:
-                            g_shared[row, dim] += g_shared[row - 1, dim]
+                for dim_slot in T.unroll(_HEAD_DIM // _OPERATOR_THREADS):
+                    dim = dim_slot * _OPERATOR_THREADS + thread
+                    gate_prefix[dim_slot] = g_shared[0, dim]
+                for row in T.serial(1, _CHUNK_SIZE):
+                    for dim_slot in T.unroll(_HEAD_DIM // _OPERATOR_THREADS):
+                        dim = dim_slot * _OPERATOR_THREADS + thread
+                        gate_prefix[dim_slot] += g_shared[row, dim]
+                        g_shared[row, dim] = gate_prefix[dim_slot]
                 T.sync_threads()
 
                 for row in T.serial(_CHUNK_SIZE):
