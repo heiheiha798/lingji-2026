@@ -486,9 +486,8 @@ def _compile_persistent_recurrence(
                     for dim in T.Parallel(_HEAD_DIM):
                         gate_prefix[0] = g_shared[0, dim]
                         for row in T.serial(1, _CHUNK_SIZE):
-                            if row < valid_tokens:
-                                gate_prefix[0] += g_shared[row, dim]
-                                g_shared[row, dim] = gate_prefix[0]
+                            gate_prefix[0] += g_shared[row, dim]
+                            g_shared[row, dim] = gate_prefix[0]
                     T.sync_threads()
 
                     for row_group in T.unroll(_CHUNK_SIZE // 4):
