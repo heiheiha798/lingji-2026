@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if (( $# < 1 )); then
-    echo "usage: $0 EXPERIMENT_NAME [K1 K2 K3 K4]" >&2
+    echo "usage: $0 EXPERIMENT_NAME [--stage preprocess|persistent|both] [K1 K2 K3 K4]" >&2
     exit 2
 fi
 
@@ -10,6 +10,19 @@ experiment_name=$1
 shift
 if [[ ! $experiment_name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
     echo "invalid experiment name: $experiment_name" >&2
+    exit 2
+fi
+stage=both
+if (( $# >= 1 )) && [[ $1 == --stage ]]; then
+    if (( $# < 2 )); then
+        echo "--stage requires preprocess, persistent, or both" >&2
+        exit 2
+    fi
+    stage=$2
+    shift 2
+fi
+if [[ $stage != preprocess && $stage != persistent && $stage != both ]]; then
+    echo "invalid stage: $stage" >&2
     exit 2
 fi
 
@@ -48,6 +61,7 @@ fi
 
 echo "experiment=$experiment_name report=$report_path artifacts=$artifact_dir"
 "$python_bin" "$task_dir/compile_report.py" \
+    --stage "$stage" \
     "${case_args[@]}" \
     --output "$report_path" \
     --artifacts-dir "$artifact_dir" 2>&1 | tee "$log_path"

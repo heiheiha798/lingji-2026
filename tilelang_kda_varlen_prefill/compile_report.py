@@ -11,7 +11,7 @@ from typing import Any
 
 from benchmark import OpSpec
 from cuda_static_metrics import analyze_cuda_source
-from submission import Submission
+from submission import _compile_chunk_operators, _compile_persistent_recurrence
 from tilelang.env import env
 
 
@@ -51,6 +51,11 @@ def main() -> None:
         choices=tuple(CASES),
         default=list(CASES),
     )
+    parser.add_argument(
+        "--stage",
+        choices=("preprocess", "persistent", "both"),
+        default="both",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--artifacts-dir", type=Path, required=True)
     args = parser.parse_args()
@@ -62,6 +67,11 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.artifacts_dir.mkdir(parents=True)
     env.disable_cache()
+    stages = (
+        ("preprocess", "persistent")
+        if args.stage == "both"
+        else (args.stage,)
+    )
 
     submission_path = Path(__file__).with_name("submission.py")
     result: dict[str, Any] = {
@@ -88,7 +98,22 @@ def main() -> None:
             flush=True,
         )
         started = time.perf_counter()
-        chunk_operators, persistent_recurrence, _ = Submission().build(spec)
+        kernels: dict[str, Any] = {}
+        if "preprocess" in stages:
+            kernels["preprocess"] = _compile_chunk_operators(
+                total_tokens, num_sequences, num_heads
+            )
+        if "persistent" in stages:
+            kernels["persistent"] = _compile_persistent_recurrence(
+                total_tokens,
+                num_sequences,
+                num_heads,
+                (
+                    64
+                    if num_sequences * num_heads >= 64
+                    else (16 if num_sequences * num_heads < 32 else 32)
+                ),
+            )
         build_seconds = time.perf_counter() - started
 
         case_artifacts = args.artifacts_dir / case_name.lower()
@@ -97,35 +122,26 @@ def main() -> None:
             "num_sequences": num_sequences,
             "num_heads": num_heads,
             "build_seconds": round(build_seconds, 3),
-            "preprocess": kernel_report(
-                chunk_operators,
-                "preprocess",
-                case_artifacts / "preprocess",
-            ),
-            "persistent": kernel_report(
-                persistent_recurrence,
-                "persistent",
-                case_artifacts / "persistent",
-            ),
         }
+        for stage in stages:
+            case_report[stage] = kernel_report(
+                kernels[stage], stage, case_artifacts / stage
+            )
         result["cases"][case_name] = case_report
         args.output.write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        preprocess = case_report["preprocess"]
-        persistent = case_report["persistent"]
-        print(
-            f"{case_name}: preprocess regs={preprocess['registers']} "
-            f"smem={preprocess['dynamic_smem_bytes']} "
-            f"spill={preprocess['spill_store_bytes']}/"
-            f"{preprocess['spill_load_bytes']}; persistent "
-            f"regs={persistent['registers']} "
-            f"smem={persistent['dynamic_smem_bytes']} "
-            f"spill={persistent['spill_store_bytes']}/"
-            f"{persistent['spill_load_bytes']}",
-            flush=True,
-        )
+        summaries = []
+        for stage in stages:
+            stage_report = case_report[stage]
+            summaries.append(
+                f"{stage} regs={stage_report['registers']} "
+                f"smem={stage_report['dynamic_smem_bytes']} "
+                f"spill={stage_report['spill_store_bytes']}/"
+                f"{stage_report['spill_load_bytes']}"
+            )
+        print(f"{case_name}: " + "; ".join(summaries), flush=True)
 
     result["completed"] = True
     args.output.write_text(

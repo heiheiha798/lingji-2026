@@ -95,13 +95,17 @@ def main() -> None:
         "| --- | --- | " + " | ".join("---:" for _ in columns) + " |",
     ]
     for case_name in sorted(baseline_cases):
+        compared_stage = False
         for stage_name in ("preprocess", "persistent"):
             baseline_stage = baseline_cases[case_name].get(stage_name)
             candidate_stage = candidate_cases[case_name].get(stage_name)
+            if baseline_stage is None or candidate_stage is None:
+                continue
             if not isinstance(baseline_stage, dict) or not isinstance(
                 candidate_stage, dict
             ):
-                parser.error(f"{case_name}/{stage_name} is missing")
+                parser.error(f"{case_name}/{stage_name} is invalid")
+            compared_stage = True
             cells = []
             for _, metric_name in columns:
                 baseline_value = baseline_stage.get(metric_name)
@@ -118,6 +122,8 @@ def main() -> None:
                 + " | ".join(cells)
                 + " |"
             )
+        if not compared_stage:
+            parser.error(f"{case_name} has no stage present in both reports")
     output = "\n".join(lines) + "\n"
     if args.output is None:
         print(output, end="")
