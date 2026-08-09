@@ -402,6 +402,7 @@ def _compile_persistent_recurrence(
             a_scale = T.alloc_local((1,), T.float32)
             dt_bias = T.alloc_local((4,), T.float32)
             gate_prefix = T.alloc_local((1,), T.float32)
+            normalized_k = T.alloc_local((4,), T.bfloat16)
 
             T.copy(
                 InitialState[
@@ -490,13 +491,17 @@ def _compile_persistent_recurrence(
                                 g_shared[row, dim] = gate_prefix[0]
                     T.sync_threads()
 
-                    for row, dim in T.Parallel(
-                        _CHUNK_SIZE, _HEAD_DIM
-                    ):
-                        k_shared[row, dim] *= norm[row]
-                        x_shared[row, dim] = k_shared[
-                            row, dim
-                        ] * T.exp2(g_shared[row, dim])
+                    for row_group in T.unroll(_CHUNK_SIZE // 4):
+                        for lane in T.vectorized(4):
+                            row = row_group * 4 + thread // 32
+                            dim = (thread % 32) * 4 + lane
+                            normalized_k[lane] = (
+                                k_shared[row, dim] * norm[row]
+                            )
+                            k_shared[row, dim] = normalized_k[lane]
+                            x_shared[row, dim] = normalized_k[
+                                lane
+                            ] * T.exp2(g_shared[row, dim])
                     for row, column in T.Parallel(
                         _CHUNK_SIZE, _CHUNK_SIZE
                     ):
