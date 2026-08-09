@@ -61,7 +61,8 @@ export PYTHONUNBUFFERED=1
     "$python_bin" "$task_dir/profile_ncu.py" --case "$case_name" \
     2>&1 | tee "$output_dir/run.log"
 
-"$nsys_bin" stats --report cuda_gpu_kern_sum --format csv "$report_path" \
+"$nsys_bin" stats --force-export=true \
+    --report cuda_gpu_kern_sum --format csv "$report_path" \
     > "$output_dir/kernel-summary.csv"
 "$nsys_bin" stats --report cuda_gpu_trace --format csv "$report_path" \
     > "$output_dir/kernel-trace.csv"
