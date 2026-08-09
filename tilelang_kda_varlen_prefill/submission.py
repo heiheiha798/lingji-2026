@@ -1468,14 +1468,23 @@ def _compile_chunk_transform(
                     chunk_prefix[0] += last_chunk - first_chunk
 
             if sequence_id[0] >= 0:
-                chunk_start = (
-                    CuSeqLens[sequence_id[0]]
-                    + chunk_in_sequence[0] * _CHUNK_SIZE
-                )
-                valid_tokens = T.min(
-                    _CHUNK_SIZE,
-                    CuSeqLens[sequence_id[0] + 1] - chunk_start,
-                )
+                if num_sequences == 1:
+                    chunk_start = chunk_in_sequence[0] * _CHUNK_SIZE
+                    if total_tokens % _CHUNK_SIZE == 0:
+                        valid_tokens = _CHUNK_SIZE
+                    else:
+                        valid_tokens = T.min(
+                            _CHUNK_SIZE, total_tokens - chunk_start
+                        )
+                else:
+                    chunk_start = (
+                        CuSeqLens[sequence_id[0]]
+                        + chunk_in_sequence[0] * _CHUNK_SIZE
+                    )
+                    valid_tokens = T.min(
+                        _CHUNK_SIZE,
+                        CuSeqLens[sequence_id[0] + 1] - chunk_start,
+                    )
                 q_shared = T.alloc_shared(
                     (_CHUNK_SIZE, _HEAD_DIM), T.bfloat16
                 )
@@ -1683,9 +1692,14 @@ def _compile_transformed_state_scan(
             first_chunk = T.alloc_local((1,), T.int32)
             last_chunk = T.alloc_local((1,), T.int32)
 
-            sequence_start = CuSeqLens[sequence]
-            sequence_length = CuSeqLens[sequence + 1] - sequence_start
-            sequence_chunks = T.ceildiv(sequence_length, _CHUNK_SIZE)
+            if num_sequences == 1:
+                sequence_start = 0
+                sequence_length = total_tokens
+                sequence_chunks = single_sequence_chunks
+            else:
+                sequence_start = CuSeqLens[sequence]
+                sequence_length = CuSeqLens[sequence + 1] - sequence_start
+                sequence_chunks = T.ceildiv(sequence_length, _CHUNK_SIZE)
             chunk_prefix[0] = 0
             if num_sequences == 1:
                 first_chunk[0] = (
@@ -1746,10 +1760,16 @@ def _compile_transformed_state_scan(
 
                 for chunk in T.serial(first_chunk[0], last_chunk[0]):
                     chunk_start = sequence_start + chunk * _CHUNK_SIZE
-                    valid_tokens = T.min(
-                        _CHUNK_SIZE,
-                        sequence_length - chunk * _CHUNK_SIZE,
-                    )
+                    if (
+                        num_sequences == 1
+                        and total_tokens % _CHUNK_SIZE == 0
+                    ):
+                        valid_tokens = _CHUNK_SIZE
+                    else:
+                        valid_tokens = T.min(
+                            _CHUNK_SIZE,
+                            sequence_length - chunk * _CHUNK_SIZE,
+                        )
                     scratch_chunk = (
                         chunk_prefix[0] + chunk - first_chunk[0]
                     )
@@ -1952,14 +1972,23 @@ def _compile_transformed_chunk_output(
                     chunk_prefix[0] += last_chunk - first_chunk
 
             if sequence_id[0] >= 0:
-                chunk_start = (
-                    CuSeqLens[sequence_id[0]]
-                    + chunk_in_sequence[0] * _CHUNK_SIZE
-                )
-                valid_tokens = T.min(
-                    _CHUNK_SIZE,
-                    CuSeqLens[sequence_id[0] + 1] - chunk_start,
-                )
+                if num_sequences == 1:
+                    chunk_start = chunk_in_sequence[0] * _CHUNK_SIZE
+                    if total_tokens % _CHUNK_SIZE == 0:
+                        valid_tokens = _CHUNK_SIZE
+                    else:
+                        valid_tokens = T.min(
+                            _CHUNK_SIZE, total_tokens - chunk_start
+                        )
+                else:
+                    chunk_start = (
+                        CuSeqLens[sequence_id[0]]
+                        + chunk_in_sequence[0] * _CHUNK_SIZE
+                    )
+                    valid_tokens = T.min(
+                        _CHUNK_SIZE,
+                        CuSeqLens[sequence_id[0] + 1] - chunk_start,
+                    )
                 q_shared = T.alloc_shared(
                     (_CHUNK_SIZE, _HEAD_DIM), T.bfloat16
                 )
