@@ -12,6 +12,68 @@ namespace {
 
 constexpr int kDagBatchNeighborCapacity = 256;
 
+__global__ void AnalyzeUpperTriangularDag(std::uint64_t *reach,
+                                          std::uint64_t *descriptors,
+                                          int vertices, int words) {
+  __shared__ int warp_degrees[8];
+  __shared__ int warp_minimum_targets[8];
+  const int row = blockIdx.x;
+  const int diagonal_word = row / 64;
+  const int diagonal_bit = row & 63;
+  const std::size_t base = static_cast<std::size_t>(row) * words;
+  int degree = 0;
+  int minimum_target = vertices;
+  for (int word = diagonal_word + threadIdx.x; word < words;
+       word += blockDim.x) {
+    std::uint64_t remaining = reach[base + word];
+    if (word == diagonal_word) {
+      remaining = diagonal_bit == 63
+                      ? 0
+                      : remaining &
+                            ~((1ULL << (diagonal_bit + 1)) - 1ULL);
+    }
+    if (word == words - 1 && (vertices & 63) != 0)
+      remaining &= (1ULL << (vertices & 63)) - 1ULL;
+    if (remaining != 0) {
+      minimum_target =
+          min(minimum_target, word * 64 + __ffsll(remaining) - 1);
+      degree += __popcll(remaining);
+    }
+  }
+  for (int offset = 16; offset > 0; offset /= 2) {
+    degree += __shfl_down_sync(0xffffffffU, degree, offset);
+    minimum_target =
+        min(minimum_target,
+            __shfl_down_sync(0xffffffffU, minimum_target, offset));
+  }
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x / 32;
+  if (lane == 0) {
+    warp_degrees[warp] = degree;
+    warp_minimum_targets[warp] = minimum_target;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    degree = lane < 8 ? warp_degrees[lane] : 0;
+    minimum_target =
+        lane < 8 ? warp_minimum_targets[lane] : vertices;
+    for (int offset = 16; offset > 0; offset /= 2) {
+      degree += __shfl_down_sync(0xffffffffU, degree, offset);
+      minimum_target =
+          min(minimum_target,
+              __shfl_down_sync(0xffffffffU, minimum_target, offset));
+    }
+    if (lane == 0) {
+      descriptors[row] =
+          (static_cast<std::uint64_t>(degree) << 32) |
+          static_cast<std::uint32_t>(minimum_target);
+      reach[base + diagonal_word] |= 1ULL << diagonal_bit;
+      if ((vertices & 63) != 0)
+        reach[base + words - 1] &= (1ULL << (vertices & 63)) - 1ULL;
+    }
+  }
+}
+
 __global__ void CloseUpperTriangularDag(std::uint64_t *reach,
                                         int *neighbors, int vertices,
                                         int words) {
@@ -141,45 +203,6 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   }
   std::vector<int> dag_batch_starts;
   bool use_parallel_dag_batches = false;
-  if (use_dag_closure) {
-    std::vector<int> minimum_targets(vertices, vertices);
-    int maximum_degree = 0;
-    for (int row = 0; row < vertices; ++row) {
-      const std::size_t base = static_cast<std::size_t>(row) * words_per_row;
-      int degree = 0;
-      for (int word = row / 64; word < words_per_row; ++word) {
-        std::uint64_t remaining = adjacency[base + word];
-        if (word == row / 64) {
-          const int diagonal_bit = row & 63;
-          remaining = diagonal_bit == 63
-                          ? 0
-                          : remaining &
-                                ~((1ULL << (diagonal_bit + 1)) - 1ULL);
-        }
-        if (word == words_per_row - 1 && (vertices & 63) != 0)
-          remaining &= (1ULL << (vertices & 63)) - 1ULL;
-        if (remaining != 0 && minimum_targets[row] == vertices) {
-          minimum_targets[row] =
-              word * 64 + __builtin_ctzll(remaining);
-        }
-        degree += __builtin_popcountll(remaining);
-      }
-      if (degree > maximum_degree) maximum_degree = degree;
-    }
-    if (maximum_degree <= kDagBatchNeighborCapacity) {
-      int batch_end = vertices;
-      while (batch_end > 0) {
-        int batch_start = batch_end - 1;
-        while (batch_start > 0 &&
-               minimum_targets[batch_start - 1] >= batch_end) {
-          --batch_start;
-        }
-        dag_batch_starts.push_back(batch_start);
-        batch_end = batch_start;
-      }
-      use_parallel_dag_batches = dag_batch_starts.size() <= 256;
-    }
-  }
   constexpr int kPivotBlock = 256;
   const std::size_t pivot_bytes = static_cast<std::size_t>(kPivotBlock) *
                                   words_per_row * sizeof(std::uint64_t);
@@ -225,9 +248,42 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
                               cudaMemcpyHostToDevice, d.stream))) {
     return 2;
   }
-  LaunchInitialize(d.reachability, vertices, words_per_row, d.stream);
-  if (!CudaOk(cudaGetLastError())) {
-    return 2;
+  if (use_dag_closure) {
+    std::vector<std::uint64_t> dag_descriptors(vertices);
+    AnalyzeUpperTriangularDag<<<vertices, 256, 0, d.stream>>>(
+        d.reachability, d.pivot_rows, vertices, words_per_row);
+    if (!CudaOk(cudaGetLastError()) ||
+        !CudaOk(cudaMemcpyAsync(dag_descriptors.data(), d.pivot_rows,
+                                static_cast<std::size_t>(vertices) *
+                                    sizeof(std::uint64_t),
+                                cudaMemcpyDeviceToHost, d.stream)) ||
+        !CudaOk(cudaStreamSynchronize(d.stream))) {
+      return 2;
+    }
+    int maximum_degree = 0;
+    for (const std::uint64_t descriptor : dag_descriptors) {
+      const int degree = static_cast<int>(descriptor >> 32);
+      if (degree > maximum_degree) maximum_degree = degree;
+    }
+    if (maximum_degree <= kDagBatchNeighborCapacity) {
+      int batch_end = vertices;
+      while (batch_end > 0) {
+        int batch_start = batch_end - 1;
+        while (batch_start > 0 &&
+               static_cast<std::uint32_t>(
+                   dag_descriptors[batch_start - 1]) >= batch_end) {
+          --batch_start;
+        }
+        dag_batch_starts.push_back(batch_start);
+        batch_end = batch_start;
+      }
+      use_parallel_dag_batches = dag_batch_starts.size() <= 256;
+    }
+  } else {
+    LaunchInitialize(d.reachability, vertices, words_per_row, d.stream);
+    if (!CudaOk(cudaGetLastError())) {
+      return 2;
+    }
   }
   if (use_dag_closure) {
     if (use_parallel_dag_batches) {
