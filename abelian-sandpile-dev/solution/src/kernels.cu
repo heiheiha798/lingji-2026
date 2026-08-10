@@ -4,21 +4,22 @@
 
 namespace {
 
+template <typename Height>
 __global__ void InitializeDenseKernel(const std::uint32_t *input,
-                                      std::uint32_t *height,
+                                      Height *height,
                                       std::uint64_t *odometer,
                                       std::size_t n) {
   const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n) {
-    height[i] = input[i];
+    height[i] = static_cast<Height>(input[i]);
     odometer[i] = 0;
   }
 }
 
+template <typename Height>
 __global__ void InitializeBoundedKernel(const std::uint32_t *input,
-                                        std::uint32_t *height_a,
-                                        std::uint32_t *height_b,
+                                        Height *height_a, Height *height_b,
                                         std::uint64_t *odometer, int rows,
                                         int cols, int *bounds) {
   __shared__ int block_bounds[4];
@@ -44,8 +45,8 @@ __global__ void InitializeBoundedKernel(const std::uint32_t *input,
     atomicMax(block_bounds + 3, y + 1);
   }
   if (valid) {
-    height_a[i] = input[i];
-    height_b[i] = input[i];
+    height_a[i] = static_cast<Height>(input[i]);
+    height_b[i] = static_cast<Height>(input[i]);
     odometer[i] = 0;
   }
   __syncthreads();
@@ -57,9 +58,9 @@ __global__ void InitializeBoundedKernel(const std::uint32_t *input,
   }
 }
 
-template <bool CheckActive, bool Bounded>
-__global__ void SweepKernel(const std::uint32_t *__restrict__ input,
-                            std::uint32_t *__restrict__ output,
+template <typename Height, bool CheckActive, bool Bounded>
+__global__ void SweepKernel(const Height *__restrict__ input,
+                            Height *__restrict__ output,
                             std::uint64_t *__restrict__ odometer, int rows,
                             int cols, int x_begin, int y_begin, int x_end,
                             int y_end, int *active) {
@@ -77,7 +78,7 @@ __global__ void SweepKernel(const std::uint32_t *__restrict__ input,
   if (x + 1 < cols) next += input[i + 1] >> 2;
   if (y > 0) next += input[i - cols] >> 2;
   if (y + 1 < rows) next += input[i + cols] >> 2;
-  output[i] = next;
+  output[i] = static_cast<Height>(next);
   if (q != 0) {
     odometer[i] += q;
     if constexpr (CheckActive) {
@@ -86,59 +87,102 @@ __global__ void SweepKernel(const std::uint32_t *__restrict__ input,
   }
 }
 
-__global__ void StoreKernel(const std::uint32_t *height,
+template <typename Height>
+__global__ void StoreKernel(const Height *height,
                             std::uint8_t *stable, std::size_t n) {
   const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n) stable[i] = static_cast<std::uint8_t>(height[i]);
 }
 
-}  // namespace
-
-void LaunchInitialize(const std::uint32_t *input, std::uint32_t *height_a,
-                      std::uint32_t *height_b, std::uint64_t *odometer,
-                      std::size_t n, int rows, int cols, int *bounds,
-                      bool find_bounds, cudaStream_t stream) {
+template <typename Height>
+void LaunchInitializeTyped(const std::uint32_t *input, Height *height_a,
+                           Height *height_b, std::uint64_t *odometer,
+                           std::size_t n, int rows, int cols, int *bounds,
+                           bool find_bounds, cudaStream_t stream) {
   if (find_bounds) {
     const dim3 block(32, 8);
     const dim3 grid((cols + block.x - 1) / block.x,
                     (rows + block.y - 1) / block.y);
-    InitializeBoundedKernel<<<grid, block, 0, stream>>>(
+    InitializeBoundedKernel<Height><<<grid, block, 0, stream>>>(
         input, height_a, height_b, odometer, rows, cols, bounds);
   } else {
-    InitializeDenseKernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0,
-                            stream>>>(input, height_a, odometer, n);
+    InitializeDenseKernel<Height>
+        <<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(
+            input, height_a, odometer, n);
   }
 }
 
-void LaunchSweep(const std::uint32_t *input, std::uint32_t *output,
-                 std::uint64_t *odometer, int rows, int cols, int x_begin,
-                 int y_begin, int x_end, int y_end, bool bounded, int *active,
-                 cudaStream_t stream) {
+template <typename Height>
+void LaunchSweepTyped(const Height *input, Height *output,
+                      std::uint64_t *odometer, int rows, int cols, int x_begin,
+                      int y_begin, int x_end, int y_end, bool bounded,
+                      int *active, cudaStream_t stream) {
   const dim3 block(32, 8);
   const unsigned int width = bounded ? x_end - x_begin : cols;
   const unsigned int height = bounded ? y_end - y_begin : rows;
   const dim3 grid((width + block.x - 1) / block.x,
                   (height + block.y - 1) / block.y);
   if (bounded && active == nullptr) {
-    SweepKernel<false, true><<<grid, block, 0, stream>>>(
+    SweepKernel<Height, false, true><<<grid, block, 0, stream>>>(
         input, output, odometer, rows, cols, x_begin, y_begin, x_end, y_end,
         nullptr);
   } else if (bounded) {
-    SweepKernel<true, true><<<grid, block, 0, stream>>>(
+    SweepKernel<Height, true, true><<<grid, block, 0, stream>>>(
         input, output, odometer, rows, cols, x_begin, y_begin, x_end, y_end,
         active);
   } else if (active == nullptr) {
-    SweepKernel<false, false><<<grid, block, 0, stream>>>(
+    SweepKernel<Height, false, false><<<grid, block, 0, stream>>>(
         input, output, odometer, rows, cols, 0, 0, cols, rows, nullptr);
   } else {
-    SweepKernel<true, false><<<grid, block, 0, stream>>>(
+    SweepKernel<Height, true, false><<<grid, block, 0, stream>>>(
         input, output, odometer, rows, cols, 0, 0, cols, rows, active);
   }
 }
 
-void LaunchStore(const std::uint32_t *height, std::uint8_t *stable,
-                 std::size_t n, cudaStream_t stream) {
-  StoreKernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(
-      height, stable, n);
+}  // namespace
+
+void LaunchInitialize(const std::uint32_t *input, void *height_a,
+                      void *height_b, std::uint64_t *odometer, std::size_t n,
+                      int rows, int cols, int *bounds, bool find_bounds,
+                      bool use_short_heights, cudaStream_t stream) {
+  if (use_short_heights) {
+    LaunchInitializeTyped(input, static_cast<std::uint16_t *>(height_a),
+                          static_cast<std::uint16_t *>(height_b), odometer, n,
+                          rows, cols, bounds, find_bounds, stream);
+  } else {
+    LaunchInitializeTyped(input, static_cast<std::uint32_t *>(height_a),
+                          static_cast<std::uint32_t *>(height_b), odometer, n,
+                          rows, cols, bounds, find_bounds, stream);
+  }
+}
+
+void LaunchSweep(const void *input, void *output, std::uint64_t *odometer,
+                 int rows, int cols, int x_begin, int y_begin, int x_end,
+                 int y_end, bool bounded, int *active, bool use_short_heights,
+                 cudaStream_t stream) {
+  if (use_short_heights) {
+    LaunchSweepTyped(static_cast<const std::uint16_t *>(input),
+                     static_cast<std::uint16_t *>(output), odometer, rows,
+                     cols, x_begin, y_begin, x_end, y_end, bounded, active,
+                     stream);
+  } else {
+    LaunchSweepTyped(static_cast<const std::uint32_t *>(input),
+                     static_cast<std::uint32_t *>(output), odometer, rows,
+                     cols, x_begin, y_begin, x_end, y_end, bounded, active,
+                     stream);
+  }
+}
+
+void LaunchStore(const void *height, std::uint8_t *stable, std::size_t n,
+                 bool use_short_heights, cudaStream_t stream) {
+  if (use_short_heights) {
+    StoreKernel<std::uint16_t>
+        <<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(
+            static_cast<const std::uint16_t *>(height), stable, n);
+  } else {
+    StoreKernel<std::uint32_t>
+        <<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(
+            static_cast<const std::uint32_t *>(height), stable, n);
+  }
 }
