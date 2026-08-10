@@ -11,7 +11,6 @@ namespace {
 
 struct DeviceResources {
   std::uint32_t *initial = nullptr;
-  std::uint8_t *stable = nullptr;
   std::uint64_t *odometer = nullptr;
   void *height_a = nullptr;
   void *height_b = nullptr;
@@ -23,7 +22,6 @@ struct DeviceResources {
     cudaFree(height_b);
     cudaFree(height_a);
     cudaFree(odometer);
-    cudaFree(stable);
     cudaFree(initial);
     if (stream != nullptr) {
       cudaStreamDestroy(stream);
@@ -59,7 +57,6 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
   DeviceResources d;
   if (!CudaOk(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking)) ||
       !CudaOk(cudaMalloc(&d.initial, n * sizeof(std::uint32_t))) ||
-      !CudaOk(cudaMalloc(&d.stable, n * sizeof(std::uint8_t))) ||
       !CudaOk(cudaMalloc(&d.odometer, n * sizeof(std::uint64_t))) ||
       !CudaOk(cudaMalloc(&d.height_a, height_bytes)) ||
       !CudaOk(cudaMalloc(&d.height_b, height_bytes)) ||
@@ -122,9 +119,16 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
       return 2;
     }
   }
-  LaunchStore(a, d.stable, n, height_width, d.stream);
-  if (!CudaOk(cudaGetLastError()) ||
-      !CudaOk(cudaMemcpyAsync(stable, d.stable, n * sizeof(std::uint8_t),
+  const void *stable_device = a;
+  if (height_width != 1) {
+    LaunchStore(a, reinterpret_cast<std::uint8_t *>(d.initial), n,
+                height_width, d.stream);
+    if (!CudaOk(cudaGetLastError())) {
+      return 2;
+    }
+    stable_device = d.initial;
+  }
+  if (!CudaOk(cudaMemcpyAsync(stable, stable_device, n * sizeof(std::uint8_t),
                               cudaMemcpyDeviceToHost, d.stream)) ||
       !CudaOk(cudaMemcpyAsync(odometer, d.odometer,
                               n * sizeof(std::uint64_t),
