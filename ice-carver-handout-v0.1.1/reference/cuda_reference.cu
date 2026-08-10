@@ -1,0 +1,270 @@
+#include "icecarver/api.h"
+
+#include "icecarver/cuda_check.h"
+#include "icecarver/mc_tables.cuh"
+
+#include <cub/device/device_scan.cuh>
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+
+namespace {
+
+constexpr std::size_t kWorkspaceAlignment = 256;
+constexpr int kThreads = 256;
+constexpr std::uint32_t kImplementationId = 2;
+
+__device__ __constant__ std::int8_t g_triangle_table[256][16];
+__device__ __constant__ std::uint8_t g_triangle_count[256];
+
+bool checked_add(std::size_t a, std::size_t b, std::size_t* result) {
+  if (a > std::numeric_limits<std::size_t>::max() - b) {
+    return false;
+  }
+  *result = a + b;
+  return true;
+}
+
+bool checked_multiply(std::size_t a, std::size_t b, std::size_t* result) {
+  if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a) {
+    return false;
+  }
+  *result = a * b;
+  return true;
+}
+
+bool append_region(std::size_t bytes, std::size_t alignment,
+                   std::size_t* cursor, std::size_t* offset) {
+  const std::size_t mask = alignment - 1;
+  std::size_t padded = 0;
+  if (!checked_add(*cursor, mask, &padded)) {
+    return false;
+  }
+  padded &= ~mask;
+  *offset = padded;
+  return checked_add(padded, bytes, cursor);
+}
+
+int validate_and_count_cells(const icecarver::Input* input,
+                             icecarver::Output* output,
+                             std::uint32_t* num_cells) {
+  if (input == nullptr || output == nullptr || input->volume == nullptr ||
+      input->isovalues == nullptr || output->triangle_counts == nullptr ||
+      input->nx < 2 || input->ny < 2 || input->nz < 2 ||
+      input->num_isovalues < 1 ||
+      input->num_isovalues > icecarver::kMaxIsovalues) {
+    return icecarver::kInvalidArgument;
+  }
+  if (input->emit_triangles != 0) {
+    for (int iso = 0; iso < input->num_isovalues; ++iso) {
+      if (output->triangles[iso] == nullptr) {
+        return icecarver::kInvalidArgument;
+      }
+    }
+  }
+
+  std::size_t xy = 0;
+  std::size_t cells = 0;
+  if (!checked_multiply(static_cast<std::size_t>(input->nx - 1),
+                        static_cast<std::size_t>(input->ny - 1), &xy) ||
+      !checked_multiply(xy, static_cast<std::size_t>(input->nz - 1),
+                        &cells) ||
+      cells > std::numeric_limits<std::uint32_t>::max() / 5U ||
+      cells > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return icecarver::kSizeOverflow;
+  }
+  *num_cells = static_cast<std::uint32_t>(cells);
+  return icecarver::kSuccess;
+}
+
+__global__ void store_workspace_descriptor(
+    icecarver::WorkspaceDescriptor* destination,
+    icecarver::WorkspaceDescriptor descriptor) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    *destination = descriptor;
+  }
+}
+
+__global__ void classify_cells(const float* __restrict__ volume, int nx,
+                               int ny, int cx, int cy,
+                               std::uint32_t num_cells,
+                               const float* __restrict__ isovalues, int iso,
+                               std::uint32_t* __restrict__ counts) {
+  const std::uint32_t cell_id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (cell_id >= num_cells) {
+    return;
+  }
+  int x = 0;
+  int y = 0;
+  int z = 0;
+  icecarver::mc::decode_cell(cell_id, cx, cy, x, y, z);
+  float values[8];
+  icecarver::mc::load_corners(volume, nx, ny, x, y, z, values);
+  const std::uint8_t cube_case =
+      icecarver::mc::case_index(values, isovalues[iso]);
+  counts[cell_id] = g_triangle_count[cube_case];
+}
+
+__global__ void publish_total(const std::uint32_t* __restrict__ counts,
+                              const std::uint32_t* __restrict__ offsets,
+                              std::uint32_t num_cells,
+                              std::uint64_t* __restrict__ totals, int iso) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const std::uint32_t last = num_cells - 1;
+    totals[iso] = static_cast<std::uint64_t>(offsets[last]) + counts[last];
+  }
+}
+
+__global__ void generate_triangles(
+    const float* __restrict__ volume, int nx, int ny, int cx, int cy,
+    std::uint32_t num_cells, const float* __restrict__ isovalues, int iso,
+    const std::uint32_t* __restrict__ counts,
+    const std::uint32_t* __restrict__ offsets,
+    icecarver::Triangle* __restrict__ triangles, std::uint64_t capacity) {
+  const std::uint32_t cell_id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (cell_id >= num_cells || counts[cell_id] == 0) {
+    return;
+  }
+
+  const std::uint32_t count = counts[cell_id];
+  const std::uint32_t offset = offsets[cell_id];
+  if (static_cast<std::uint64_t>(offset) + count > capacity) {
+    return;
+  }
+
+  int x = 0;
+  int y = 0;
+  int z = 0;
+  icecarver::mc::decode_cell(cell_id, cx, cy, x, y, z);
+  float values[8];
+  icecarver::mc::load_corners(volume, nx, ny, x, y, z, values);
+  const float isovalue = isovalues[iso];
+  const std::uint8_t cube_case =
+      icecarver::mc::case_index(values, isovalue);
+  const std::int8_t* row = g_triangle_table[cube_case];
+  for (std::uint32_t triangle = 0; triangle < count; ++triangle) {
+    triangles[offset + triangle] = icecarver::mc::make_triangle(
+        row, static_cast<int>(triangle), x, y, z, values, isovalue);
+  }
+}
+
+}  // namespace
+
+extern "C" int icecarver_reference_solve(const icecarver::Input* input,
+                                icecarver::Output* output, void* workspace,
+                                std::size_t workspace_bytes,
+                                cudaStream_t stream) {
+  std::uint32_t num_cells = 0;
+  const int validation = validate_and_count_cells(input, output, &num_cells);
+  if (validation != icecarver::kSuccess) {
+    return validation;
+  }
+
+  std::size_t scan_temp_bytes = 0;
+  cudaError_t status = cub::DeviceScan::ExclusiveSum(
+      nullptr, scan_temp_bytes, static_cast<const std::uint32_t*>(nullptr),
+      static_cast<std::uint32_t*>(nullptr), static_cast<int>(num_cells),
+      stream);
+  if (status != cudaSuccess) {
+    return icecarver::kCudaFailure;
+  }
+
+  std::size_t counts_bytes = 0;
+  std::size_t offsets_bytes = 0;
+  if (!checked_multiply(static_cast<std::size_t>(num_cells),
+                        sizeof(std::uint32_t), &counts_bytes) ||
+      !checked_multiply(static_cast<std::size_t>(num_cells),
+                        sizeof(std::uint32_t), &offsets_bytes)) {
+    return icecarver::kSizeOverflow;
+  }
+
+  std::size_t cursor = sizeof(icecarver::WorkspaceDescriptor);
+  std::size_t counts_offset = 0;
+  std::size_t offsets_offset = 0;
+  std::size_t scan_temp_offset = 0;
+  if (!append_region(counts_bytes, kWorkspaceAlignment, &cursor,
+                     &counts_offset) ||
+      !append_region(offsets_bytes, kWorkspaceAlignment, &cursor,
+                     &offsets_offset) ||
+      !append_region(scan_temp_bytes, kWorkspaceAlignment, &cursor,
+                     &scan_temp_offset)) {
+    return icecarver::kSizeOverflow;
+  }
+  const std::size_t required_bytes = cursor;
+  if (workspace == nullptr || workspace_bytes < required_bytes) {
+    return icecarver::kInsufficientWorkspace;
+  }
+  if ((reinterpret_cast<std::uintptr_t>(workspace) &
+       (kWorkspaceAlignment - 1)) != 0) {
+    return icecarver::kInvalidArgument;
+  }
+
+  auto* bytes = static_cast<unsigned char*>(workspace);
+  auto* counts = reinterpret_cast<std::uint32_t*>(bytes + counts_offset);
+  auto* offsets = reinterpret_cast<std::uint32_t*>(bytes + offsets_offset);
+  void* scan_temp = bytes + scan_temp_offset;
+
+  const icecarver::WorkspaceDescriptor descriptor{
+      icecarver::kWorkspaceMagic,
+      icecarver::kWorkspaceVersion,
+      kImplementationId,
+      static_cast<std::uint64_t>(required_bytes),
+      num_cells,
+      static_cast<std::uint64_t>(counts_offset),
+      static_cast<std::uint64_t>(offsets_offset),
+      static_cast<std::uint64_t>(scan_temp_offset),
+      static_cast<std::uint64_t>(scan_temp_bytes),
+      {0, 0, 0}};
+  store_workspace_descriptor<<<1, 1, 0, stream>>>(
+      static_cast<icecarver::WorkspaceDescriptor*>(workspace), descriptor);
+  ICECARVER_RETURN_IF_LAUNCH_ERROR();
+
+  ICECARVER_RETURN_IF_CUDA_ERROR(cudaMemcpyToSymbolAsync(
+      g_triangle_table, icecarver::mc::kTriangleTable,
+      sizeof(icecarver::mc::kTriangleTable), 0, cudaMemcpyHostToDevice,
+      stream));
+  ICECARVER_RETURN_IF_CUDA_ERROR(cudaMemcpyToSymbolAsync(
+      g_triangle_count, icecarver::mc::kTriangleCount,
+      sizeof(icecarver::mc::kTriangleCount), 0, cudaMemcpyHostToDevice,
+      stream));
+  ICECARVER_RETURN_IF_CUDA_ERROR(cudaMemsetAsync(
+      output->triangle_counts, 0,
+      static_cast<std::size_t>(input->num_isovalues) * sizeof(std::uint64_t),
+      stream));
+
+  const unsigned int blocks =
+      (num_cells + static_cast<std::uint32_t>(kThreads) - 1U) /
+      static_cast<std::uint32_t>(kThreads);
+  for (int iso = 0; iso < input->num_isovalues; ++iso) {
+    classify_cells<<<blocks, kThreads, 0, stream>>>(
+        input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
+        num_cells, input->isovalues, iso, counts);
+    ICECARVER_RETURN_IF_LAUNCH_ERROR();
+
+    ICECARVER_RETURN_IF_CUDA_ERROR(cub::DeviceScan::ExclusiveSum(
+        scan_temp, scan_temp_bytes, counts, offsets,
+        static_cast<int>(num_cells), stream));
+    publish_total<<<1, 1, 0, stream>>>(counts, offsets, num_cells,
+                                      output->triangle_counts, iso);
+    ICECARVER_RETURN_IF_LAUNCH_ERROR();
+
+    if (input->emit_triangles != 0) {
+      std::uint64_t total = 0;
+      ICECARVER_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
+          &total, output->triangle_counts + iso, sizeof(total),
+          cudaMemcpyDeviceToHost, stream));
+      ICECARVER_RETURN_IF_CUDA_ERROR(cudaStreamSynchronize(stream));
+      if (total > output->capacities[iso]) {
+        return icecarver::kInsufficientOutput;
+      }
+      generate_triangles<<<blocks, kThreads, 0, stream>>>(
+          input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
+          num_cells, input->isovalues, iso, counts, offsets,
+          output->triangles[iso], output->capacities[iso]);
+      ICECARVER_RETURN_IF_LAUNCH_ERROR();
+    }
+  }
+
+  return icecarver::kSuccess;
+}

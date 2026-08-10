@@ -1,0 +1,63 @@
+{
+  "schema_version": "1.0",
+  "problem": "ice-carver",
+  "manifest_version": "0.1.1",
+  "score_totals": {
+    "correctness": 40,
+    "absolute_performance": 30
+  },
+  "run_policy": {
+    "warmup_runs": 2,
+    "measure_runs": 5
+  },
+  "cases": [
+    {
+      "id": "P0",
+      "num_isovalues": 1,
+      "correctness_weight": 4,
+      "performance_weight": 0
+    },
+    {
+      "id": "P1",
+      "num_isovalues": 1,
+      "correctness_weight": 4,
+      "performance_weight": 0
+    },
+    {
+      "id": "P2",
+      "num_isovalues": 1,
+      "correctness_weight": 5,
+      "performance_weight": 0
+    },
+    {
+      "id": "P3",
+      "num_isovalues": 1,
+      "correctness_weight": 5,
+      "performance_weight": 0
+    },
+    {
+      "id": "P4",
+      "num_isovalues": 2,
+      "correctness_weight": 5,
+      "performance_weight": 5
+    },
+    {
+      "id": "P5",
+      "num_isovalues": 4,
+      "correctness_weight": 5,
+      "performance_weight": 7
+    },
+    {
+      "id": "P6",
+      "num_isovalues": 4,
+      "correctness_weight": 6,
+      "performance_weight": 8
+    },
+    {
+      "id": "P7",
+      "num_isovalues": 8,
+      "correctness_weight": 6,
+      "performance_weight": 10
+    }
+  ]
+}

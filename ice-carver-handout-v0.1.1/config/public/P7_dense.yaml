@@ -1,0 +1,13 @@
+id: P7
+field: dense
+shape: [512, 384, 320]
+seed: 397429
+isovalues: [-1.05, -0.75, -0.45, -0.15, 0.15, 0.45, 0.75, 1.05]
+per_iso_capacity: 16000000
+warmup_runs: 2
+measure_runs: 5
+abs_tolerance: 1.0e-5
+rel_tolerance: 1.0e-5
+timeout_seconds: 600
+correctness_weight: 6
+performance_weight: 10

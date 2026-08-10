@@ -1,0 +1,13 @@
+id: P4
+field: multiscale
+shape: [256, 256, 256]
+seed: 252103
+isovalues: [-0.25, 0.25]
+per_iso_capacity: 6000000
+warmup_runs: 2
+measure_runs: 5
+abs_tolerance: 1.0e-5
+rel_tolerance: 1.0e-5
+timeout_seconds: 600
+correctness_weight: 5
+performance_weight: 5

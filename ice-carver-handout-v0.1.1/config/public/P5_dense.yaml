@@ -1,0 +1,13 @@
+id: P5
+field: dense
+shape: [320, 256, 224]
+seed: 300119
+isovalues: [-0.75, -0.25, 0.25, 0.75]
+per_iso_capacity: 8000000
+warmup_runs: 2
+measure_runs: 5
+abs_tolerance: 1.0e-5
+rel_tolerance: 1.0e-5
+timeout_seconds: 600
+correctness_weight: 5
+performance_weight: 7

@@ -1,0 +1,234 @@
+{
+  "basic": [
+    {
+      "name": "basic_length_1",
+      "batch_size": 1,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "page_size": 16,
+      "max_seq_len": 16,
+      "seq_lens": {"mode": "explicit", "values": [1]},
+      "seed": 401,
+      "weight": 1.0
+    },
+    {
+      "name": "basic_page_boundaries",
+      "batch_size": 8,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "page_size": 16,
+      "max_seq_len": 33,
+      "seq_lens": {
+        "mode": "explicit",
+        "values": [1, 2, 15, 16, 17, 31, 32, 33]
+      },
+      "seed": 402,
+      "weight": 1.0
+    },
+    {
+      "name": "basic_page32_group8",
+      "batch_size": 8,
+      "num_q_heads": 64,
+      "num_kv_heads": 8,
+      "page_size": 32,
+      "max_seq_len": 65,
+      "seq_lens": {
+        "mode": "explicit",
+        "values": [1, 31, 32, 33, 47, 63, 64, 65]
+      },
+      "seed": 403,
+      "weight": 1.0
+    }
+  ],
+  "correctness": [
+    {
+      "name": "correctness_random_pages_p16",
+      "batch_size": 8,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "page_size": 16,
+      "max_seq_len": 257,
+      "seq_lens": {
+        "mode": "explicit",
+        "values": [1, 16, 17, 63, 64, 65, 129, 257]
+      },
+      "seed": 501,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_random_pages_p32",
+      "batch_size": 8,
+      "num_q_heads": 64,
+      "num_kv_heads": 8,
+      "page_size": 32,
+      "max_seq_len": 513,
+      "seq_lens": {
+        "mode": "explicit",
+        "values": [1, 31, 32, 33, 127, 128, 129, 513]
+      },
+      "seed": 502,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_gqa4_h64",
+      "batch_size": 16,
+      "num_q_heads": 64,
+      "num_kv_heads": 16,
+      "page_size": 16,
+      "max_seq_len": 1024,
+      "seq_lens": {"mode": "uniform", "low": 1, "high": 1024},
+      "seed": 503,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_mixed_lengths",
+      "batch_size": 32,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "page_size": 16,
+      "max_seq_len": 2048,
+      "seq_lens": {
+        "mode": "mixture",
+        "groups": [
+          {"count": 4, "low": 1536, "high": 2048},
+          {"count": 28, "low": 1, "high": 128}
+        ]
+      },
+      "seed": 504,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_shared_prefix",
+      "batch_size": 16,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "page_size": 16,
+      "max_seq_len": 512,
+      "shared_prefix_pages": 8,
+      "seq_lens": {"mode": "uniform", "low": 160, "high": 512},
+      "seed": 505,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_large_logits",
+      "batch_size": 8,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "page_size": 16,
+      "max_seq_len": 512,
+      "seq_lens": {
+        "mode": "explicit",
+        "values": [65, 127, 128, 129, 255, 256, 257, 511]
+      },
+      "profile": {"q_scale": 2.0, "k_scale": 2.0, "v_scale": 0.5},
+      "seed": 506,
+      "weight": 1.0
+    },
+    {
+      "name": "correctness_near_uniform",
+      "batch_size": 8,
+      "num_q_heads": 64,
+      "num_kv_heads": 8,
+      "page_size": 32,
+      "max_seq_len": 256,
+      "seq_lens": {
+        "mode": "explicit",
+        "values": [1, 31, 32, 33, 95, 127, 128, 255]
+      },
+      "profile": {"q_scale": 0.02, "k_scale": 0.02, "v_scale": 1.5},
+      "seed": 507,
+      "weight": 1.0
+    }
+  ],
+  "performance": [
+    {
+      "name": "performance_mixed",
+      "batch_size": 8,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "page_size": 16,
+      "max_seq_len": 256,
+      "seq_lens": {
+        "mode": "explicit",
+        "values": [256, 192, 128, 64, 33, 31, 16, 7]
+      },
+      "seed": 601,
+      "weight": 0.5
+    },
+    {
+      "name": "performance_mixed_lengths",
+      "batch_size": 16,
+      "num_q_heads": 64,
+      "num_kv_heads": 8,
+      "page_size": 32,
+      "max_seq_len": 512,
+      "seq_lens": {
+        "mode": "mixture",
+        "groups": [
+          {"count": 4, "low": 384, "high": 512},
+          {"count": 12, "low": 16, "high": 96}
+        ]
+      },
+      "seed": 602,
+      "weight": 0.5
+    }
+  ],
+  "official": [
+    {
+      "name": "G1_single_long",
+      "batch_size": 1,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "page_size": 16,
+      "max_seq_len": 32768,
+      "seq_lens": {"mode": "uniform", "low": 24576, "high": 32768},
+      "seed": 2001,
+      "weight": 0.2
+    },
+    {
+      "name": "G2_staircase_lengths",
+      "batch_size": 8,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "page_size": 16,
+      "max_seq_len": 32768,
+      "seq_lens": {
+        "mode": "jittered_base",
+        "base": [32768, 16384, 8192, 4096, 2048, 1024, 512, 256],
+        "low_scale": 0.9,
+        "high_scale": 1.0
+      },
+      "seed": 2002,
+      "weight": 0.3
+    },
+    {
+      "name": "G3_mixed_lengths",
+      "batch_size": 32,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "page_size": 16,
+      "max_seq_len": 16384,
+      "seq_lens": {
+        "mode": "mixture",
+        "groups": [
+          {"count": 4, "low": 12288, "high": 16384},
+          {"count": 8, "low": 2048, "high": 4096},
+          {"count": 20, "low": 256, "high": 1024}
+        ]
+      },
+      "seed": 2003,
+      "weight": 0.3
+    },
+    {
+      "name": "G4_large_batch_short",
+      "batch_size": 128,
+      "num_q_heads": 64,
+      "num_kv_heads": 8,
+      "page_size": 32,
+      "max_seq_len": 1024,
+      "seq_lens": {"mode": "uniform", "low": 128, "high": 1024},
+      "seed": 2004,
+      "weight": 0.2
+    }
+  ]
+}

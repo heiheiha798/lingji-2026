@@ -1,0 +1,14 @@
+# Medium correctness case; small enough for rapid iteration.
+id: P2
+field: gyroid
+shape: [160, 160, 160]
+seed: 169087
+isovalues: [0.0]
+per_iso_capacity: 4000000
+warmup_runs: 2
+measure_runs: 5
+abs_tolerance: 1.0e-5
+rel_tolerance: 1.0e-5
+timeout_seconds: 600
+correctness_weight: 5
+performance_weight: 0

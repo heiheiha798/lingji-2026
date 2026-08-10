@@ -1,0 +1,2 @@
+torch==2.6.0
+tilelang @ git+https://github.com/tile-ai/tilelang.git@v0.1.12

@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ice-carver.invalid/schema/case-result-1.0.json",
+  "title": "Ice Carver per-case evaluator result",
+  "$comment": "JSON Schema checks shape only. score.py additionally enforces the trusted official manifest. A correct case requires all 2 ordered warmups + 5 ordered measures; an incorrect case may contain an ordered run prefix. score.py also enforces dependent count lengths, finite numbers, timing/median rules, and correctness evidence invariants.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "problem", "solver", "environment", "case"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "problem": { "const": "ice-carver" },
+    "solver": { "enum": ["public", "target"] },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gpu_name",
+        "compute_capability",
+        "global_memory_bytes",
+        "driver_version",
+        "cuda_runtime_version"
+      ],
+      "properties": {
+        "gpu_name": { "type": "string", "minLength": 1 },
+        "compute_capability": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+        "global_memory_bytes": { "type": "integer", "minimum": 1 },
+        "driver_version": { "type": "integer", "minimum": 1 },
+        "cuda_runtime_version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "case": {
+      "$ref": "#/$defs/case"
+    }
+  },
+  "$defs": {
+    "uint64String": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "field",
+        "shape",
+        "num_isovalues",
+        "isovalues",
+        "base_seed",
+        "per_iso_capacity",
+        "workspace_bytes",
+        "warmup_runs",
+        "measure_runs",
+        "abs_tolerance",
+        "rel_tolerance",
+        "timeout_seconds",
+        "correctness_weight",
+        "performance_weight",
+        "correct",
+        "median_time_ms",
+        "runs"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "field": {
+          "enum": ["sphere", "metaball", "gyroid", "mixed", "multiscale", "dense"]
+        },
+        "shape": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "integer", "minimum": 2 }
+        },
+        "num_isovalues": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "isovalues": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "type": "number" }
+        },
+        "base_seed": { "$ref": "#/$defs/uint64String" },
+        "per_iso_capacity": { "type": "integer", "minimum": 1 },
+        "workspace_bytes": { "type": "integer", "minimum": 268435456 },
+        "warmup_runs": { "const": 2 },
+        "measure_runs": { "const": 5 },
+        "abs_tolerance": { "type": "number", "minimum": 0 },
+        "rel_tolerance": { "type": "number", "minimum": 0 },
+        "timeout_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "correctness_weight": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Informational copy; score.py uses and verifies the trusted manifest value."
+        },
+        "performance_weight": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Informational copy; score.py uses and verifies the trusted manifest value."
+        },
+        "correct": { "type": "boolean" },
+        "median_time_ms": {
+          "oneOf": [
+            { "type": "number", "minimum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "runs": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 7,
+          "items": { "$ref": "#/$defs/run" }
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "index",
+        "seed",
+        "solver_status",
+        "solver_status_name",
+        "reference_status",
+        "reference_status_name",
+        "cuda_time_ms",
+        "wall_time_ms",
+        "official_time_ms",
+        "timed_out",
+        "validation"
+      ],
+      "properties": {
+        "phase": { "enum": ["warmup", "measure"] },
+        "index": { "type": "integer", "minimum": 0 },
+        "seed": { "$ref": "#/$defs/uint64String" },
+        "solver_status": { "type": "integer" },
+        "solver_status_name": { "type": "string" },
+        "reference_status": { "type": "integer" },
+        "reference_status_name": { "type": "string" },
+        "cuda_time_ms": { "type": "number", "minimum": 0 },
+        "wall_time_ms": { "type": "number", "minimum": 0 },
+        "official_time_ms": { "type": "number", "minimum": 0 },
+        "timed_out": { "type": "boolean" },
+        "validation": { "$ref": "#/$defs/validation" }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "correct",
+        "counts_match",
+        "capacity_ok",
+        "finite",
+        "guards_intact",
+        "values_within_tolerance",
+        "mismatched_values",
+        "nonfinite_values",
+        "guard_corruptions",
+        "max_abs_error",
+        "max_rel_error",
+        "candidate_counts",
+        "reference_counts",
+        "message"
+      ],
+      "properties": {
+        "correct": { "type": "boolean" },
+        "counts_match": { "type": "boolean" },
+        "capacity_ok": { "type": "boolean" },
+        "finite": { "type": "boolean" },
+        "guards_intact": { "type": "boolean" },
+        "values_within_tolerance": { "type": "boolean" },
+        "mismatched_values": { "type": "integer", "minimum": 0 },
+        "nonfinite_values": { "type": "integer", "minimum": 0 },
+        "guard_corruptions": { "type": "integer", "minimum": 0 },
+        "max_abs_error": { "type": "number", "minimum": 0 },
+        "max_rel_error": { "type": "number", "minimum": 0 },
+        "candidate_counts": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 8,
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "reference_counts": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 8,
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+id: P3
+field: mixed
+shape: [256, 192, 160]
+seed: 203057
+isovalues: [0.0]
+per_iso_capacity: 4000000
+warmup_runs: 2
+measure_runs: 5
+abs_tolerance: 1.0e-5
+rel_tolerance: 1.0e-5
+timeout_seconds: 600
+correctness_weight: 5
+performance_weight: 0

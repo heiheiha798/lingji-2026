@@ -1,0 +1,13 @@
+id: P6
+field: mixed
+shape: [384, 384, 384]
+seed: 349081
+isovalues: [-0.18, -0.04, 0.10, 0.24]
+per_iso_capacity: 10000000
+warmup_runs: 2
+measure_runs: 5
+abs_tolerance: 1.0e-5
+rel_tolerance: 1.0e-5
+timeout_seconds: 600
+correctness_weight: 6
+performance_weight: 8

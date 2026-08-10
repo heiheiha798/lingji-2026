@@ -1,0 +1,14 @@
+# Public correctness case: a single smooth closed surface.
+id: P0
+field: sphere
+shape: [64, 64, 64]
+seed: 104729
+isovalues: [0.0]
+per_iso_capacity: 250000
+warmup_runs: 2
+measure_runs: 5
+abs_tolerance: 1.0e-5
+rel_tolerance: 1.0e-5
+timeout_seconds: 600
+correctness_weight: 4
+performance_weight: 0

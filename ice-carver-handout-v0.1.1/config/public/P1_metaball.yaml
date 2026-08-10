@@ -1,0 +1,14 @@
+# Public correctness case: several moving implicit blobs.
+id: P1
+field: metaball
+shape: [96, 96, 96]
+seed: 130363
+isovalues: [0.0]
+per_iso_capacity: 1000000
+warmup_runs: 2
+measure_runs: 5
+abs_tolerance: 1.0e-5
+rel_tolerance: 1.0e-5
+timeout_seconds: 600
+correctness_weight: 4
+performance_weight: 0
