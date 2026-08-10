@@ -8,12 +8,12 @@
 void LaunchInitialize(const std::uint32_t *input, void *height_a,
                       void *height_b, std::uint64_t *odometer, std::size_t n,
                       int rows, int cols, int *bounds, bool find_bounds,
-                      bool use_short_heights, cudaStream_t stream);
+                      int height_width, cudaStream_t stream);
 
 void LaunchSweep(const void *input, void *output,
                  std::uint64_t *odometer, int rows, int cols, int x_begin,
                  int y_begin, int x_end, int y_end, bool bounded, int *active,
-                 bool use_short_heights, cudaStream_t stream);
+                 int height_width, cudaStream_t stream);
 
 void LaunchStore(const void *height, std::uint8_t *stable, std::size_t n,
-                 bool use_short_heights, cudaStream_t stream);
+                 int height_width, cudaStream_t stream);
