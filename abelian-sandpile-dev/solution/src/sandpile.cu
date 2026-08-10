@@ -43,6 +43,12 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
     return 1;
   }
   const std::size_t n = static_cast<std::size_t>(rows) * cols;
+  int sampled_active = 0;
+  for (std::size_t sample = 0; sample < 256; ++sample) {
+    const std::size_t i = sample * n / 256;
+    sampled_active += initial[i] >= 4U;
+  }
+  const bool dense = sampled_active >= 4;
   DeviceResources d;
   if (!CudaOk(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking)) ||
       !CudaOk(cudaMalloc(&d.initial, n * sizeof(std::uint32_t))) ||
@@ -50,7 +56,7 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
       !CudaOk(cudaMalloc(&d.odometer, n * sizeof(std::uint64_t))) ||
       !CudaOk(cudaMalloc(&d.height_a, n * sizeof(std::uint32_t))) ||
       !CudaOk(cudaMalloc(&d.height_b, n * sizeof(std::uint32_t))) ||
-      !CudaOk(cudaMalloc(&d.active, sizeof(int))) ||
+      !CudaOk(cudaMalloc(&d.active, 5 * sizeof(int))) ||
       !CudaOk(cudaMemcpyAsync(d.initial, initial, n * sizeof(std::uint32_t),
                               cudaMemcpyHostToDevice, d.stream))) {
     return 2;
@@ -58,18 +64,43 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
 
   auto *a = d.height_a;
   auto *b = d.height_b;
-  LaunchInitialize(d.initial, a, d.odometer, n, d.stream);
+  int host_control[5] = {0, cols, rows, 0, 0};
+  if (!dense) {
+    if (!CudaOk(cudaMemcpyAsync(d.active, host_control, sizeof(host_control),
+                                cudaMemcpyHostToDevice, d.stream))) {
+      return 2;
+    }
+  }
+  LaunchInitialize(d.initial, a, b, d.odometer, n, rows, cols, d.active + 1,
+                   !dense, d.stream);
   if (!CudaOk(cudaGetLastError())) {
     return 2;
   }
-  int host_active = 1;
+  if (!dense) {
+    if (!CudaOk(cudaMemcpyAsync(host_control + 1, d.active + 1,
+                                4 * sizeof(int), cudaMemcpyDeviceToHost,
+                                d.stream)) ||
+        !CudaOk(cudaStreamSynchronize(d.stream))) {
+      return 2;
+    }
+  }
+  int x_begin = dense ? 0 : host_control[1];
+  int y_begin = dense ? 0 : host_control[2];
+  int x_end = dense ? cols : host_control[3];
+  int y_end = dense ? rows : host_control[4];
+  int host_active = x_begin < x_end ? 1 : 0;
   while (host_active != 0) {
     host_active = 0;
     if (!CudaOk(cudaMemsetAsync(d.active, 0, sizeof(int), d.stream))) {
       return 2;
     }
     for (int sweep = 0; sweep < 16; ++sweep) {
-      LaunchSweep(a, b, d.odometer, rows, cols,
+      if (x_begin > 0) --x_begin;
+      if (y_begin > 0) --y_begin;
+      if (x_end < cols) ++x_end;
+      if (y_end < rows) ++y_end;
+      LaunchSweep(a, b, d.odometer, rows, cols, x_begin, y_begin, x_end, y_end,
+                  x_begin != 0 || y_begin != 0 || x_end != cols || y_end != rows,
                   sweep == 15 ? d.active : nullptr, d.stream);
       if (!CudaOk(cudaGetLastError())) {
         return 2;
