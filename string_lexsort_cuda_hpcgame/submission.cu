@@ -5,11 +5,22 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 
 namespace {
 
 constexpr int kThreads = 256;
+
+
+struct GraphEntry {
+  const uint8_t* strings;
+  int32_t* output;
+  int32_t* workspace;
+  int32_t n;
+  int32_t width;
+  cudaGraphExec_t executable;
+};
 
 
 template <int kWidth, int kStart = 0>
@@ -245,14 +256,48 @@ void lexsort_cuda(
   const uint8_t* input_strings = strings.data_ptr<uint8_t>();
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int32_t blocks = (n + kThreads - 1) / kThreads;
+  static thread_local std::vector<GraphEntry> graph_entries;
+  for (const GraphEntry& entry : graph_entries) {
+    if (entry.strings == input_strings &&
+        entry.output == output &&
+        entry.workspace == scratch &&
+        entry.n == n &&
+        entry.width == width) {
+      const cudaError_t replay_status =
+          cudaGraphLaunch(entry.executable, stream);
+      TORCH_CHECK(
+          replay_status == cudaSuccess,
+          "CUDA graph replay failed: ",
+          cudaGetErrorString(replay_status));
+      return;
+    }
+  }
+
+  cudaGraph_t graph = nullptr;
+  cudaStream_t capture_stream = nullptr;
+  const cudaError_t stream_status = cudaStreamCreateWithFlags(
+      &capture_stream, cudaStreamNonBlocking);
+  TORCH_CHECK(
+      stream_status == cudaSuccess,
+      "CUDA graph capture stream creation failed: ",
+      cudaGetErrorString(stream_status));
+  const cudaError_t begin_status = cudaStreamBeginCapture(
+      capture_stream, cudaStreamCaptureModeThreadLocal);
+  TORCH_CHECK(
+      begin_status == cudaSuccess,
+      "CUDA graph capture failed to start: ",
+      cudaGetErrorString(begin_status));
 
   if (width == 16) {
-    sort_tiles<16><<<blocks, kThreads, 0, stream>>>(input_strings, output, n);
+    sort_tiles<16><<<blocks, kThreads, 0, capture_stream>>>(
+        input_strings, output, n);
   } else if (width == 32) {
-    sort_tiles<32><<<blocks, kThreads, 0, stream>>>(input_strings, output, n);
+    sort_tiles<32><<<blocks, kThreads, 0, capture_stream>>>(
+        input_strings, output, n);
   } else {
     TORCH_CHECK(width == 64, "unsupported string width: ", width);
-    sort_tiles<64><<<blocks, kThreads, 0, stream>>>(input_strings, output, n);
+    sort_tiles<64><<<blocks, kThreads, 0, capture_stream>>>(
+        input_strings, output, n);
   }
 
   const int32_t* source = output;
@@ -261,13 +306,13 @@ void lexsort_cuda(
        run_length < n;
        run_length <<= 1) {
     if (width == 16) {
-      merge_pass<16><<<blocks, kThreads, 0, stream>>>(
+      merge_pass<16><<<blocks, kThreads, 0, capture_stream>>>(
           input_strings, source, destination, n, run_length);
     } else if (width == 32) {
-      merge_pass<32><<<blocks, kThreads, 0, stream>>>(
+      merge_pass<32><<<blocks, kThreads, 0, capture_stream>>>(
           input_strings, source, destination, n, run_length);
     } else {
-      merge_pass<64, true><<<blocks, kThreads, 0, stream>>>(
+      merge_pass<64, true><<<blocks, kThreads, 0, capture_stream>>>(
           input_strings, source, destination, n, run_length);
     }
     const int32_t* completed = destination;
@@ -281,7 +326,7 @@ void lexsort_cuda(
         source,
         static_cast<size_t>(n) * sizeof(int32_t),
         cudaMemcpyDeviceToDevice,
-        stream);
+        capture_stream);
     TORCH_CHECK(
         copy_status == cudaSuccess,
         "failed to copy final indices: ",
@@ -292,4 +337,33 @@ void lexsort_cuda(
       launch_status == cudaSuccess,
       "CUDA kernel launch failed: ",
       cudaGetErrorString(launch_status));
+  const cudaError_t end_status = cudaStreamEndCapture(capture_stream, &graph);
+  TORCH_CHECK(
+      end_status == cudaSuccess,
+      "CUDA graph capture failed to finish: ",
+      cudaGetErrorString(end_status));
+  cudaGraphExec_t executable = nullptr;
+  const cudaError_t instantiate_status =
+      cudaGraphInstantiate(&executable, graph, 0);
+  const cudaError_t destroy_status = cudaGraphDestroy(graph);
+  const cudaError_t stream_destroy_status = cudaStreamDestroy(capture_stream);
+  TORCH_CHECK(
+      instantiate_status == cudaSuccess,
+      "CUDA graph instantiation failed: ",
+      cudaGetErrorString(instantiate_status));
+  TORCH_CHECK(
+      destroy_status == cudaSuccess,
+      "CUDA graph destruction failed: ",
+      cudaGetErrorString(destroy_status));
+  TORCH_CHECK(
+      stream_destroy_status == cudaSuccess,
+      "CUDA graph capture stream destruction failed: ",
+      cudaGetErrorString(stream_destroy_status));
+  graph_entries.push_back(
+      {input_strings, output, scratch, n, width, executable});
+  const cudaError_t first_launch_status = cudaGraphLaunch(executable, stream);
+  TORCH_CHECK(
+      first_launch_status == cudaSuccess,
+      "CUDA graph launch failed: ",
+      cudaGetErrorString(first_launch_status));
 }
