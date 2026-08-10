@@ -14,8 +14,8 @@ namespace {
 
 constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr int kThreads = 256;
-constexpr int kRowThreads = 128;
-constexpr std::uint32_t kImplementationId = 6;
+constexpr int kRowThreads = 64;
+constexpr std::uint32_t kImplementationId = 7;
 
 __device__ __constant__ std::int8_t g_triangle_table[256][16];
 __device__ __constant__ std::uint8_t g_triangle_count[256];
