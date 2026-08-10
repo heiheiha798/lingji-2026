@@ -14,6 +14,7 @@ import json
 import math
 import os
 import statistics
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -30,7 +31,10 @@ from fla.modules.l2norm import l2norm_fwd
 from fla.ops.common.gate import fused_beta_sigmoid
 from fla.ops.kda import fused_recurrent_kda
 from fla.ops.kda.chunk_fwd import chunk_kda_fwd
-from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
+from fla.ops.kda.fused_recurrent import (
+    fused_recurrent_kda_fwd,
+    fused_recurrent_kda_fwd_kernel,
+)
 from fla.ops.utils.index import prepare_chunk_indices
 
 
@@ -113,6 +117,8 @@ CANDIDATES = (
     "recurrent",
     "hybrid64",
     "hybrid64_direct_epi",
+    "hybrid_lt64_direct_epi",
+    "hybrid_lt64_direct_launch",
     "hybrid256",
 )
 
@@ -242,30 +248,82 @@ def run_append(
 ) -> None:
     max_length = max(call.lengths)
     use_recurrent = candidate == "recurrent"
-    use_recurrent |= candidate in ("hybrid64", "hybrid64_direct_epi") and max_length <= 64
+    use_recurrent |= candidate in (
+        "hybrid64",
+        "hybrid64_direct_epi",
+    ) and max_length <= 64
+    use_recurrent |= candidate in (
+        "hybrid_lt64_direct_epi",
+        "hybrid_lt64_direct_launch",
+    ) and max_length < 64
     use_recurrent |= candidate == "hybrid256" and max_length <= 256
 
     if use_recurrent:
-        _, state_holder[0] = fused_recurrent_kda_fwd(
-            q=call.q,
-            k=call.k,
-            v=call.v,
-            g=call.g,
-            beta=call.beta,
-            A_log=a_log,
-            dt_bias=dt_bias,
-            initial_state=state_holder[0],
-            scale=K**-0.5,
-            output_final_state=True,
-            inplace_final_state=True,
-            state_v_first=True,
-            cu_seqlens=call.cu_seqlens,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            lower_bound=LOWER_BOUND,
-            out=call.recurrent_raw,
-        )
+        if candidate == "hybrid_lt64_direct_launch":
+            sequences = len(call.lengths)
+            heads = call.q.shape[2]
+            uniform_lengths = len(set(call.lengths)) == 1
+            fused_recurrent_kda_fwd_kernel[(4 * sequences * heads,)](
+                q=call.q,
+                k=call.k,
+                v=call.v,
+                g=call.g,
+                beta=call.beta,
+                A_log=a_log,
+                dt_bias=dt_bias,
+                o=call.recurrent_raw,
+                h0=state_holder[0],
+                ht=state_holder[0],
+                cu_seqlens=(
+                    None if uniform_lengths else call.cu_seqlens
+                ),
+                ssm_state_indices=None,
+                num_accepted_tokens=None,
+                lower_bound=LOWER_BOUND,
+                scale=K**-0.5,
+                N=sequences,
+                T=(call.lengths[0] if uniform_lengths else call.q.shape[1]),
+                H=heads,
+                HV=heads,
+                K=K,
+                V=V,
+                BK=K,
+                BV=32,
+                stride_init_state_token=state_holder[0].stride(0),
+                stride_final_state_token=state_holder[0].stride(0),
+                stride_indices_seq=1,
+                stride_indices_tok=1,
+                INPLACE_FINAL_STATE=True,
+                IS_BETA_HEADWISE=False,
+                USE_QK_L2NORM_IN_KERNEL=True,
+                USE_GATE_IN_KERNEL=True,
+                APPLY_BETA_SIGMOID=True,
+                ALLOW_NEG_EIGVAL=False,
+                STATE_V_FIRST=True,
+                num_warps=4,
+                num_stages=2,
+            )
+        else:
+            _, state_holder[0] = fused_recurrent_kda_fwd(
+                q=call.q,
+                k=call.k,
+                v=call.v,
+                g=call.g,
+                beta=call.beta,
+                A_log=a_log,
+                dt_bias=dt_bias,
+                initial_state=state_holder[0],
+                scale=K**-0.5,
+                output_final_state=True,
+                inplace_final_state=True,
+                state_v_first=True,
+                cu_seqlens=call.cu_seqlens,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                lower_bound=LOWER_BOUND,
+                out=call.recurrent_raw,
+            )
         apply_epilogue(
             call.recurrent_raw,
             call.output_gate,
@@ -273,7 +331,11 @@ def run_append(
             call.output,
             call.output_rstd,
             fused=candidate != "starter32",
-            direct=candidate == "hybrid64_direct_epi",
+            direct=candidate in (
+                "hybrid64_direct_epi",
+                "hybrid_lt64_direct_epi",
+                "hybrid_lt64_direct_launch",
+            ),
         )
         return
 
@@ -309,7 +371,11 @@ def run_append(
         call.output,
         call.output_rstd,
         fused=candidate != "starter32",
-        direct=candidate == "hybrid64_direct_epi",
+        direct=candidate in (
+            "hybrid64_direct_epi",
+            "hybrid_lt64_direct_epi",
+            "hybrid_lt64_direct_launch",
+        ),
     )
 
 
@@ -349,25 +415,66 @@ def run_decode(
         )
         return
 
-    _, state_holder[0] = fused_recurrent_kda_fwd(
-        q=call.q,
-        k=call.k,
-        v=call.v,
-        g=call.g,
-        beta=call.beta,
-        A_log=a_log,
-        dt_bias=dt_bias,
-        initial_state=state_holder[0],
-        scale=K**-0.5,
-        output_final_state=True,
-        inplace_final_state=True,
-        state_v_first=True,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
-        lower_bound=LOWER_BOUND,
-        out=call.recurrent_raw,
-    )
+    if candidate == "hybrid_lt64_direct_launch":
+        batch, _, heads, _ = call.q.shape
+        fused_recurrent_kda_fwd_kernel[(4 * batch * heads,)](
+            q=call.q,
+            k=call.k,
+            v=call.v,
+            g=call.g,
+            beta=call.beta,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            o=call.recurrent_raw,
+            h0=state_holder[0],
+            ht=state_holder[0],
+            cu_seqlens=None,
+            ssm_state_indices=None,
+            num_accepted_tokens=None,
+            lower_bound=LOWER_BOUND,
+            scale=K**-0.5,
+            N=batch,
+            T=1,
+            H=heads,
+            HV=heads,
+            K=K,
+            V=V,
+            BK=K,
+            BV=32,
+            stride_init_state_token=state_holder[0].stride(0),
+            stride_final_state_token=state_holder[0].stride(0),
+            stride_indices_seq=1,
+            stride_indices_tok=1,
+            INPLACE_FINAL_STATE=True,
+            IS_BETA_HEADWISE=False,
+            USE_QK_L2NORM_IN_KERNEL=True,
+            USE_GATE_IN_KERNEL=True,
+            APPLY_BETA_SIGMOID=True,
+            ALLOW_NEG_EIGVAL=False,
+            STATE_V_FIRST=True,
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        _, state_holder[0] = fused_recurrent_kda_fwd(
+            q=call.q,
+            k=call.k,
+            v=call.v,
+            g=call.g,
+            beta=call.beta,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            initial_state=state_holder[0],
+            scale=K**-0.5,
+            output_final_state=True,
+            inplace_final_state=True,
+            state_v_first=True,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            lower_bound=LOWER_BOUND,
+            out=call.recurrent_raw,
+        )
     apply_epilogue(
         call.recurrent_raw,
         call.output_gate,
@@ -375,7 +482,11 @@ def run_decode(
         call.output,
         call.output_rstd,
         fused=True,
-        direct=candidate == "hybrid64_direct_epi",
+        direct=candidate in (
+            "hybrid64_direct_epi",
+            "hybrid_lt64_direct_epi",
+            "hybrid_lt64_direct_launch",
+        ),
     )
 
 
@@ -497,12 +608,17 @@ def benchmark_case(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("validate", "benchmark"), default="benchmark")
+    parser.add_argument(
+        "--mode",
+        choices=("validate", "submission-validate", "benchmark"),
+        default="benchmark",
+    )
     parser.add_argument("--cases", default="all")
     parser.add_argument("--candidates", default="hybrid64")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--replays", type=int, default=3)
     parser.add_argument("--decode-sample-steps", type=int, default=128)
+    parser.add_argument("--validation-decode-steps", type=int, default=257)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--nvtx", action="store_true")
     parser.add_argument("--cuda-profiler-api", action="store_true")
@@ -516,8 +632,16 @@ def main() -> None:
     physical_gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if physical_gpu not in ("6", "7"):
         raise RuntimeError("set CUDA_VISIBLE_DEVICES to physical GPU 6 or 7")
-    if args.warmup < 1 or args.replays < 1 or args.decode_sample_steps < 1:
-        raise ValueError("warmup, replays, and decode-sample-steps must be positive")
+    if (
+        args.warmup < 1
+        or args.replays < 1
+        or args.decode_sample_steps < 1
+        or args.validation_decode_steps < 1
+    ):
+        raise ValueError(
+            "warmup, replays, decode-sample-steps, and "
+            "validation-decode-steps must be positive"
+        )
     fla_git_commit = os.environ.get("FLA_GIT_COMMIT")
     if fla_git_commit is None:
         raise RuntimeError("set FLA_GIT_COMMIT explicitly")
@@ -592,6 +716,46 @@ def main() -> None:
             lower_bound=LOWER_BOUND,
             out=call.recurrent_raw,
         )
+        direct_state = initial_state.clone()
+        direct_raw = torch.empty_like(call.recurrent_raw)
+        fused_recurrent_kda_fwd_kernel[(4 * len(lengths) * heads,)](
+            q=call.q,
+            k=call.k,
+            v=call.v,
+            g=call.g,
+            beta=call.beta,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            o=direct_raw,
+            h0=direct_state,
+            ht=direct_state,
+            cu_seqlens=call.cu_seqlens,
+            ssm_state_indices=None,
+            num_accepted_tokens=None,
+            lower_bound=LOWER_BOUND,
+            scale=K**-0.5,
+            N=len(lengths),
+            T=call.q.shape[1],
+            H=heads,
+            HV=heads,
+            K=K,
+            V=V,
+            BK=K,
+            BV=32,
+            stride_init_state_token=direct_state.stride(0),
+            stride_final_state_token=direct_state.stride(0),
+            stride_indices_seq=1,
+            stride_indices_tok=1,
+            INPLACE_FINAL_STATE=True,
+            IS_BETA_HEADWISE=False,
+            USE_QK_L2NORM_IN_KERNEL=True,
+            USE_GATE_IN_KERNEL=True,
+            APPLY_BETA_SIGMOID=True,
+            ALLOW_NEG_EIGVAL=False,
+            STATE_V_FIRST=True,
+            num_warps=4,
+            num_stages=2,
+        )
         torch.cuda.synchronize()
 
         pt_output = torch.empty_like(chunk_raw)
@@ -628,6 +792,8 @@ def main() -> None:
         for name, actual, expected in (
             ("raw_output", chunk_raw, recurrent_raw),
             ("state", chunk_state, recurrent_state),
+            ("direct_raw_vs_wrapper", direct_raw, recurrent_raw),
+            ("direct_state_vs_wrapper", direct_state, recurrent_state),
             ("fused_epilogue", fused_output, pt_output),
             ("direct_epilogue", direct_output, pt_output),
             ("direct_vs_fla_epilogue", direct_output, fused_output),
@@ -645,6 +811,277 @@ def main() -> None:
                 ),
             }
         print(json.dumps({"validation": metrics}, indent=2, sort_keys=True))
+        return
+
+    if args.mode == "submission-validate":
+        task_dir = Path(__file__).resolve().parents[1]
+        sys.path.insert(0, str(task_dir))
+        from judge.contract import (
+            AppendInputs,
+            CaseSpec,
+            DecodeInput,
+            KDAConfig,
+            LayerParams,
+            Limits,
+            StateMode,
+        )
+        from submission import Submission as CandidateSubmission
+
+        if args.cases == "all":
+            requested_cases = ("C48", "C24", "D48-B1", "D24")
+        else:
+            requested_cases = tuple(args.cases.split(","))
+        supported_cases = {"C48", "C24", "D48-B1", "D48", "D24"}
+        if (
+            not requested_cases
+            or any(not item for item in requested_cases)
+            or len(requested_cases) != len(set(requested_cases))
+            or not set(requested_cases) <= supported_cases
+        ):
+            raise ValueError(
+                "submission validation cases must be unique members of "
+                "C48,C24,D48-B1,D48,D24"
+            )
+
+        torch.manual_seed(20260810)
+        validation_results: list[dict[str, object]] = []
+        passed = True
+        for case_name in requested_cases:
+            profile_case = next(case for case in CASES if case.name == case_name)
+            config = KDAConfig(heads=profile_case.heads)
+            case = CaseSpec(
+                case_id=f"synthetic-{case_name}",
+                config=config,
+                batch=profile_case.batch,
+                state_mode=StateMode.CHECKPOINT,
+                limits=Limits(0.006, 0.004, 0.015),
+                append_lengths=profile_case.append_lengths,
+                decode_steps=min(
+                    profile_case.decode_steps,
+                    args.validation_decode_steps,
+                ),
+            )
+            a_log = torch.empty(
+                profile_case.heads, device="cuda", dtype=torch.float32
+            ).uniform_(-0.25, 0.25)
+            dt_bias = torch.randn(
+                profile_case.heads, K, device="cuda", dtype=torch.float32
+            ) * 0.1
+            norm_weight = torch.randn(V, device="cuda", dtype=torch.float32)
+            layer = LayerParams(a_log, dt_bias, norm_weight)
+            initial_state = torch.randn(
+                profile_case.batch,
+                profile_case.heads,
+                V,
+                K,
+                device="cuda",
+                dtype=torch.float32,
+            ) * 0.02
+            reference_state = [initial_state.clone()]
+            submission = CandidateSubmission()
+            context = submission.prepare(config, layer, case)
+            private_state = submission.load_state(context, initial_state)
+            case_metrics: list[dict[str, object]] = []
+
+            for append_index, lengths in enumerate(profile_case.append_lengths):
+                call = allocate_append(lengths, profile_case.heads)
+                if case_name in ("C24", "D24"):
+                    call.g.add_(-7.0)
+                elif case_name == "C48":
+                    call.g.add_(3.0)
+                elif case_name == "D48":
+                    call.g.add_(-2.0)
+                run_append(
+                    call,
+                    "starter32",
+                    reference_state,
+                    a_log,
+                    dt_bias,
+                    norm_weight,
+                )
+                cu_seqlens = call.cu_seqlens
+                if cu_seqlens is None:
+                    cu_seqlens = torch.tensor(
+                        [0, sum(lengths)],
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                candidate_output = torch.empty(
+                    sum(lengths),
+                    profile_case.heads,
+                    V,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                submission.append_chunk(
+                    context,
+                    private_state,
+                    AppendInputs(
+                        q_act=call.q.squeeze(0),
+                        k_act=call.k.squeeze(0),
+                        v_act=call.v.squeeze(0),
+                        g_raw=call.g.squeeze(0),
+                        beta_raw=call.beta.squeeze(0),
+                        output_gate_logits=call.output_gate.squeeze(0),
+                        cu_seqlens=cu_seqlens,
+                        descriptor=torch.empty(
+                            0, 4, device="cuda", dtype=torch.int32
+                        ),
+                    ),
+                    candidate_output,
+                )
+                torch.cuda.synchronize()
+                for kind, actual, expected, limit in (
+                    (
+                        "output",
+                        candidate_output,
+                        call.output.squeeze(0),
+                        case.limits.output_relative_l2,
+                    ),
+                    (
+                        "state",
+                        private_state.canonical_state,
+                        reference_state[0],
+                        case.limits.state_relative_l2,
+                    ),
+                ):
+                    actual_fp32 = actual.float()
+                    expected_fp32 = expected.float()
+                    diff = actual_fp32 - expected_fp32
+                    relative_l2 = float(
+                        torch.linalg.vector_norm(diff)
+                        / torch.linalg.vector_norm(expected_fp32).clamp_min(1e-12)
+                    )
+                    normalized_max = float(
+                        diff.abs().max()
+                        / expected_fp32.abs().max().clamp_min(1.0)
+                    )
+                    metric_passed = (
+                        math.isfinite(relative_l2)
+                        and math.isfinite(normalized_max)
+                        and relative_l2 <= limit
+                        and normalized_max <= case.limits.normalized_max
+                    )
+                    passed &= metric_passed
+                    case_metrics.append(
+                        {
+                            "point": f"append-{append_index + 1}",
+                            "kind": kind,
+                            "relative_l2": relative_l2,
+                            "normalized_max": normalized_max,
+                            "passed": metric_passed,
+                        }
+                    )
+
+            if case.decode_steps:
+                call = allocate_decode(profile_case.batch, profile_case.heads)
+                if case_name == "D24":
+                    call.g.add_(-7.0)
+                elif case_name == "D48":
+                    call.g.add_(-2.0)
+                candidate_output = torch.empty(
+                    profile_case.batch,
+                    profile_case.heads,
+                    V,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                token = DecodeInput(
+                    q_act=call.q.squeeze(1),
+                    k_act=call.k.squeeze(1),
+                    v_act=call.v.squeeze(1),
+                    g_raw=call.g.squeeze(1),
+                    beta_raw=call.beta.squeeze(1),
+                    output_gate_logits=call.output_gate.squeeze(1),
+                )
+                checkpoints = {
+                    step
+                    for step in (1, 17, 257, 4096, case.decode_steps)
+                    if step <= case.decode_steps
+                }
+                for step in range(1, case.decode_steps + 1):
+                    run_decode(
+                        call,
+                        "starter32",
+                        reference_state,
+                        a_log,
+                        dt_bias,
+                        norm_weight,
+                    )
+                    submission.decode_step(
+                        context,
+                        private_state,
+                        token,
+                        candidate_output,
+                    )
+                    if step not in checkpoints:
+                        continue
+                    torch.cuda.synchronize()
+                    for kind, actual, expected, limit in (
+                        (
+                            "output",
+                            candidate_output,
+                            call.output.squeeze(1),
+                            case.limits.output_relative_l2,
+                        ),
+                        (
+                            "state",
+                            private_state.canonical_state,
+                            reference_state[0],
+                            case.limits.state_relative_l2,
+                        ),
+                    ):
+                        actual_fp32 = actual.float()
+                        expected_fp32 = expected.float()
+                        diff = actual_fp32 - expected_fp32
+                        relative_l2 = float(
+                            torch.linalg.vector_norm(diff)
+                            / torch.linalg.vector_norm(expected_fp32).clamp_min(1e-12)
+                        )
+                        normalized_max = float(
+                            diff.abs().max()
+                            / expected_fp32.abs().max().clamp_min(1.0)
+                        )
+                        metric_passed = (
+                            math.isfinite(relative_l2)
+                            and math.isfinite(normalized_max)
+                            and relative_l2 <= limit
+                            and normalized_max <= case.limits.normalized_max
+                        )
+                        passed &= metric_passed
+                        case_metrics.append(
+                            {
+                                "point": f"decode-{step}",
+                                "kind": kind,
+                                "relative_l2": relative_l2,
+                                "normalized_max": normalized_max,
+                                "passed": metric_passed,
+                            }
+                        )
+
+            case_result = {
+                "case": case_name,
+                "decode_steps": case.decode_steps,
+                "metrics": case_metrics,
+            }
+            validation_results.append(case_result)
+            print(json.dumps(case_result, sort_keys=True), flush=True)
+            del submission, context, private_state, reference_state, initial_state
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        payload = {
+            "submission_validation": validation_results,
+            "passed": passed,
+        }
+        print(json.dumps({"summary": {"passed": passed}}, sort_keys=True))
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n"
+            )
+        if not passed:
+            raise RuntimeError("submission trajectory validation failed")
         return
 
     if args.cases == "all":
