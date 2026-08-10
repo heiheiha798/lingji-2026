@@ -9,6 +9,38 @@
 
 namespace {
 
+__global__ void CloseUpperTriangularDag(std::uint64_t *reach,
+                                        int *neighbors, int vertices,
+                                        int words) {
+  __shared__ int neighbor_count;
+  for (int row = vertices - 1; row >= 0; --row) {
+    if (threadIdx.x == 0) neighbor_count = 0;
+    __syncthreads();
+    const std::size_t base = static_cast<std::size_t>(row) * words;
+    for (int word = threadIdx.x; word < words; word += blockDim.x) {
+      std::uint64_t remaining = reach[base + word];
+      if (word == row / 64) remaining &= ~(1ULL << (row & 63));
+      while (remaining != 0) {
+        const int bit = __ffsll(static_cast<long long>(remaining)) - 1;
+        const int position = atomicAdd(&neighbor_count, 1);
+        neighbors[position] = word * 64 + bit;
+        remaining &= remaining - 1;
+      }
+    }
+    __syncthreads();
+    const int count = neighbor_count;
+    for (int word = threadIdx.x; word < words; word += blockDim.x) {
+      std::uint64_t output = reach[base + word];
+      for (int index = 0; index < count; ++index) {
+        output |= reach[static_cast<std::size_t>(neighbors[index]) * words +
+                        word];
+      }
+      reach[base + word] = output;
+    }
+    __syncthreads();
+  }
+}
+
 struct DeviceResources {
   std::uint64_t *reachability = nullptr;
   std::uint64_t *pivot_rows = nullptr;
@@ -46,21 +78,30 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   }
   const std::size_t bytes = static_cast<std::size_t>(vertices) *
                             words_per_row * sizeof(std::uint64_t);
-  bool upper_triangular = true;
-  for (int row = 1; row < vertices && upper_triangular; ++row) {
+  int adjacent_successors = 0;
+  for (int row = 0;
+       row + 1 < vertices && adjacent_successors < vertices / 2; ++row) {
+    const std::size_t base = static_cast<std::size_t>(row) * words_per_row;
+    if ((adjacency[base + (row + 1) / 64] &
+         (1ULL << ((row + 1) & 63))) != 0) {
+      ++adjacent_successors;
+    }
+  }
+  bool use_dag_closure = adjacent_successors < vertices / 2;
+  for (int row = 1; row < vertices && use_dag_closure; ++row) {
     const std::size_t base = static_cast<std::size_t>(row) * words_per_row;
     const int diagonal_word = row / 64;
     for (int word = 0; word < diagonal_word; ++word) {
       if (adjacency[base + word] != 0) {
-        upper_triangular = false;
+        use_dag_closure = false;
         break;
       }
     }
     const int diagonal_bit = row & 63;
-    if (upper_triangular && diagonal_bit != 0 &&
+    if (use_dag_closure && diagonal_bit != 0 &&
         (adjacency[base + diagonal_word] &
          ((1ULL << diagonal_bit) - 1ULL)) != 0) {
-      upper_triangular = false;
+      use_dag_closure = false;
     }
   }
   constexpr int kPivotBlock = 256;
@@ -112,9 +153,10 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   if (!CudaOk(cudaGetLastError())) {
     return 2;
   }
-  if (upper_triangular) {
-    LaunchUpperTriangularClosure(d.reachability, d.pivot_rows, vertices,
-                                 words_per_row, d.stream);
+  if (use_dag_closure) {
+    CloseUpperTriangularDag<<<1, 256, 0, d.stream>>>(
+        d.reachability, reinterpret_cast<int *>(d.pivot_rows), vertices,
+        words_per_row);
   } else {
     const int pivot_stride = words_per_row <= 512 ? kPivotBlock : 128;
     for (int block_start = 0; block_start < vertices;
