@@ -67,31 +67,19 @@ __global__ void BuildPivotRows(const std::uint64_t *reach,
 
 __global__ void ApplyPivotBlock(std::uint64_t *reach,
                                 const std::uint64_t *pivot_rows,
-                                const std::uint64_t *pivot_masks,
                                 int vertices, int words, int block_start,
                                 int block_size) {
-  __shared__ std::uint64_t closed_mask;
   const int row = blockIdx.x;
   if (row >= vertices) return;
   const std::size_t base = static_cast<std::size_t>(row) * words;
-  if (threadIdx.x == 0) {
-    std::uint64_t remaining = reach[base + block_start / kPivotBlock];
-    remaining &= block_size == kPivotBlock
-                     ? ~0ULL
-                     : (1ULL << block_size) - 1ULL;
-    std::uint64_t output = 0;
-    while (remaining != 0) {
-      const int source = __ffsll(static_cast<long long>(remaining)) - 1;
-      output |= pivot_masks[source];
-      remaining &= remaining - 1;
-    }
-    closed_mask = output;
-  }
-  __syncthreads();
+  std::uint64_t row_mask = reach[base + block_start / kPivotBlock];
+  row_mask &= block_size == kPivotBlock
+                  ? ~0ULL
+                  : (1ULL << block_size) - 1ULL;
 
   for (int word = threadIdx.x; word < words; word += blockDim.x) {
     std::uint64_t output = reach[base + word];
-    std::uint64_t remaining = closed_mask;
+    std::uint64_t remaining = row_mask;
     while (remaining != 0) {
       const int source = __ffsll(static_cast<long long>(remaining)) - 1;
       output |= pivot_rows[static_cast<std::size_t>(source) * words + word];
@@ -120,6 +108,5 @@ void LaunchPivotBlock(std::uint64_t *reachability,
   BuildPivotRows<<<block_size, 128, 0, stream>>>(
       reachability, pivot_rows, pivot_masks, words, block_start, block_size);
   ApplyPivotBlock<<<vertices, 128, 0, stream>>>(
-      reachability, pivot_rows, pivot_masks, vertices, words, block_start,
-      block_size);
+      reachability, pivot_rows, vertices, words, block_start, block_size);
 }

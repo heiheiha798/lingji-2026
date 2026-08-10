@@ -11,6 +11,15 @@
 device-to-device 全矩阵复制。临时存储仅包含 64 条 pivot 行和 64 个块内
 可达 mask。
 
+`BuildPivotRows` 生成的每条 pivot 行本身已经包含块内闭包。应用到普通行时
+直接按该行原始 pivot bits 合并这些闭包行即可，不需要先通过 `pivot_masks`
+再次扩张 mask。这样删除了一次串行 bitset 闭包、CTA barrier，并显著减少
+SCC workload 中重复合并的 pivot 行数。
+
+CUDA 12.8 / GPU7 合法冷进程 baseline 的 P1 至 P5 为 369.442、645.194、
+804.665、336.064、2059.116 ms；删除重复 mask 闭包后为 346.098、431.966、
+777.112、330.967、1546.766 ms。随机五类功能测试全部通过。
+
 ## 额外依赖
 
 无。
