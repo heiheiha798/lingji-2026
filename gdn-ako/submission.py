@@ -27,5 +27,6 @@ def gdn_chunk_scan(q, k, v, g, beta, scale):
         q=q, k=k, v=v, g=g, beta=beta,
         scale=scale, initial_state=None, output_final_state=False,
         use_qk_l2norm_in_kernel=True,
+        state_v_first=True,
     )
     return o
