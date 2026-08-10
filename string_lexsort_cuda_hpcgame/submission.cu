@@ -34,11 +34,46 @@ __device__ __forceinline__ bool index_less(
 }
 
 
-__global__ void initialize_indices(int32_t* indices, int32_t n) {
-  const int32_t index =
-      static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+__global__ void sort_tiles(
+    const uint8_t* __restrict__ strings,
+    int32_t* __restrict__ indices,
+    int32_t n,
+    int32_t width) {
+  __shared__ int32_t tile[kThreads];
+
+  const int32_t lane = static_cast<int32_t>(threadIdx.x);
+  const int32_t index = static_cast<int32_t>(blockIdx.x * kThreads) + lane;
+  tile[lane] = index < n ? index : INT32_MAX;
+  __syncthreads();
+
+  for (int32_t size = 2; size <= kThreads; size <<= 1) {
+    for (int32_t stride = size >> 1; stride > 0; stride >>= 1) {
+      const int32_t partner = lane ^ stride;
+      if (partner > lane) {
+        const int32_t lhs = tile[lane];
+        const int32_t rhs = tile[partner];
+        const bool ascending = (lane & size) == 0;
+        bool exchange;
+        if (ascending) {
+          exchange = lhs == INT32_MAX
+              ? rhs != INT32_MAX
+              : rhs != INT32_MAX && index_less(rhs, lhs, strings, width);
+        } else {
+          exchange = rhs == INT32_MAX
+              ? lhs != INT32_MAX
+              : lhs != INT32_MAX && index_less(lhs, rhs, strings, width);
+        }
+        if (exchange) {
+          tile[lane] = rhs;
+          tile[partner] = lhs;
+        }
+      }
+      __syncthreads();
+    }
+  }
+
   if (index < n) {
-    indices[index] = index;
+    indices[index] = tile[lane];
   }
 }
 
@@ -126,11 +161,13 @@ void lexsort_cuda(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int32_t blocks = (n + kThreads - 1) / kThreads;
 
-  initialize_indices<<<blocks, kThreads, 0, stream>>>(output, n);
+  sort_tiles<<<blocks, kThreads, 0, stream>>>(input_strings, output, n, width);
 
   const int32_t* source = output;
   int32_t* destination = scratch;
-  for (int32_t run_length = 1; run_length < n; run_length <<= 1) {
+  for (int32_t run_length = kThreads;
+       run_length < n;
+       run_length <<= 1) {
     merge_pass<<<blocks, kThreads, 0, stream>>>(
         input_strings,
         source,
