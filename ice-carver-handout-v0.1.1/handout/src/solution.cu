@@ -3,7 +3,6 @@
 #include "icecarver/cuda_check.h"
 #include "icecarver/mc_tables.cuh"
 
-#include <cub/block/block_scan.cuh>
 #include <cub/device/device_scan.cuh>
 
 #include <cstddef>
@@ -16,7 +15,8 @@ namespace {
 constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr int kThreads = 256;
 constexpr int kRowThreads = 64;
-constexpr std::uint32_t kImplementationId = 9;
+constexpr int kEmitWarps = 2;
+constexpr std::uint32_t kImplementationId = 10;
 
 __device__ __constant__ std::int8_t g_triangle_table[256][16];
 __device__ __constant__ std::uint8_t g_triangle_count[256];
@@ -221,35 +221,47 @@ __global__ void generate_triangles(
 
 __global__ void generate_triangles_by_row(
     const float* __restrict__ volume, int nx, int ny, int cx, int cy,
-    const float* __restrict__ isovalues, int iso,
+    std::uint32_t num_rows, const float* __restrict__ isovalues, int iso,
     const std::uint8_t* __restrict__ counts,
     const std::uint32_t* __restrict__ row_offsets,
     const std::uint64_t* __restrict__ totals,
     icecarver::Triangle* __restrict__ triangles, std::uint64_t capacity) {
-  using BlockScan = cub::BlockScan<std::uint32_t, kRowThreads>;
-  __shared__ typename BlockScan::TempStorage scan_storage;
-  __shared__ std::uint32_t row_prefix;
-
   if (totals[iso] > capacity) {
     return;
   }
-  const std::uint32_t row_id = blockIdx.x;
-  const int y = static_cast<int>(row_id % static_cast<std::uint32_t>(cy));
-  const int z = static_cast<int>(row_id / static_cast<std::uint32_t>(cy));
-  if (threadIdx.x == 0) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const std::uint32_t row_id = blockIdx.x * kEmitWarps + warp;
+  if (row_id >= num_rows) {
+    return;
+  }
+  int y = 0;
+  int z = 0;
+  std::uint32_t row_prefix = 0;
+  if (lane == 0) {
+    y = static_cast<int>(row_id % static_cast<std::uint32_t>(cy));
+    z = static_cast<int>(row_id / static_cast<std::uint32_t>(cy));
     row_prefix = row_offsets[row_id];
   }
-  __syncthreads();
-  for (int base_x = 0; base_x < cx; base_x += blockDim.x) {
-    const int x = base_x + threadIdx.x;
+  y = __shfl_sync(0xffffffffU, y, 0);
+  z = __shfl_sync(0xffffffffU, z, 0);
+  row_prefix = __shfl_sync(0xffffffffU, row_prefix, 0);
+  for (int base_x = 0; base_x < cx; base_x += 32) {
+    const int x = base_x + lane;
     const std::uint32_t cell_id =
         row_id * static_cast<std::uint32_t>(cx) +
         static_cast<std::uint32_t>(x);
     const std::uint32_t count = x < cx ? counts[cell_id] : 0;
-    std::uint32_t local_offset = 0;
-    std::uint32_t block_total = 0;
-    BlockScan(scan_storage).ExclusiveSum(count, local_offset, block_total);
-    const std::uint32_t offset = row_prefix + local_offset;
+    std::uint32_t inclusive = count;
+#pragma unroll
+    for (int delta = 1; delta < 32; delta <<= 1) {
+      const std::uint32_t preceding =
+          __shfl_up_sync(0xffffffffU, inclusive, delta);
+      if (lane >= delta) {
+        inclusive += preceding;
+      }
+    }
+    const std::uint32_t offset = row_prefix + inclusive - count;
 
     if (count != 0 &&
         static_cast<std::uint64_t>(offset) + count <= capacity) {
@@ -264,11 +276,7 @@ __global__ void generate_triangles_by_row(
             row, static_cast<int>(triangle), x, y, z, values, isovalue);
       }
     }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      row_prefix += block_total;
-    }
-    __syncthreads();
+    row_prefix += __shfl_sync(0xffffffffU, inclusive, 31);
   }
 }
 
@@ -416,10 +424,13 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
           row_counts, row_offsets, rows, output->triangle_counts, iso);
       ICECARVER_RETURN_IF_LAUNCH_ERROR();
       if (input->emit_triangles != 0) {
-        generate_triangles_by_row<<<rows, kRowThreads, 0, stream>>>(
+        const unsigned int row_blocks =
+            (rows + static_cast<unsigned int>(kEmitWarps) - 1U) /
+            static_cast<unsigned int>(kEmitWarps);
+        generate_triangles_by_row<<<row_blocks, kRowThreads, 0, stream>>>(
             input->volume, input->nx, input->ny, input->nx - 1,
-            input->ny - 1, input->isovalues, iso, iso_counts, row_offsets,
-            output->triangle_counts, output->triangles[iso],
+            input->ny - 1, rows, input->isovalues, iso, iso_counts,
+            row_offsets, output->triangle_counts, output->triangles[iso],
             output->capacities[iso]);
         ICECARVER_RETURN_IF_LAUNCH_ERROR();
       }
