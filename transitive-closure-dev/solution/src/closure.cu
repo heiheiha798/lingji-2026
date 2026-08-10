@@ -289,9 +289,9 @@ __global__ void CloseOrderedBlocksCooperative(
            word += word_tiles * blockDim.x) {
         std::uint64_t output = block_rows[scratch_base + word];
         for (int index = 0; index < count; ++index) {
-          output |= reach[static_cast<std::size_t>(
-                              global_neighbors[row_offset * neighbor_capacity +
-                                               index]) *
+          const int target =
+              global_neighbors[row_offset * neighbor_capacity + index];
+          output |= reach[static_cast<std::size_t>(representatives[target]) *
                               words +
                           word];
         }
@@ -299,16 +299,15 @@ __global__ void CloseOrderedBlocksCooperative(
       }
     }
     grid.sync();
-
-    if (active && !representative) {
-      const int source_row = representatives[row];
-      for (int word = word_tile * blockDim.x + threadIdx.x; word < words;
-           word += word_tiles * blockDim.x) {
-        reach[static_cast<std::size_t>(row) * words + word] =
-            reach[static_cast<std::size_t>(source_row) * words + word];
-      }
+  }
+  for (int row = row_offset; row < vertices; row += kOrderedBlockSize) {
+    const int representative = representatives[row];
+    if (representative == row) continue;
+    for (int word = word_tile * blockDim.x + threadIdx.x; word < words;
+         word += word_tiles * blockDim.x) {
+      reach[static_cast<std::size_t>(row) * words + word] =
+          reach[static_cast<std::size_t>(representative) * words + word];
     }
-    grid.sync();
   }
 }
 
