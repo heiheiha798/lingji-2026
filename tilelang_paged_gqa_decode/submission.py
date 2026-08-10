@@ -149,6 +149,7 @@ def _compile_paged_gqa_split(
     max_seq_len: int,
     page_size: int,
     num_splits: int,
+    pages_per_split: int,
 ):
     group_size = num_q_heads // num_kv_heads
     max_pages = (max_seq_len + page_size - 1) // page_size
@@ -188,86 +189,87 @@ def _compile_paged_gqa_split(
             score_sum = T.alloc_fragment((_BLOCK_H,), T.float32)
             normalizer = T.alloc_fragment((_BLOCK_H,), T.float32)
 
-            T.clear(q_shared)
-            T.copy(
-                Q[
-                    batch,
-                    kv_head * group_size : (kv_head + 1) * group_size,
-                    :,
-                ],
-                q_shared[0:group_size, :],
-            )
-            T.clear(output)
-            T.clear(normalizer)
-            T.fill(score_max, -T.infinity(T.float32))
-
             page_count = T.ceildiv(SeqLens[batch], page_size)
-            pages_per_split = T.floordiv(page_count, num_splits)
-            remaining_pages = T.floormod(page_count, num_splits)
-            split_page_count = pages_per_split + T.if_then_else(
-                split < remaining_pages, 1, 0
-            )
-            start_page = (
-                pages_per_split * split + T.min(split, remaining_pages)
-            )
-            for page_offset in T.Pipelined(
-                split_page_count, num_stages=1
-            ):
-                logical_page = start_page + page_offset
-                physical_page = BlockTable[batch, logical_page]
+            active_splits = T.ceildiv(page_count, pages_per_split)
+            if split < active_splits:
+                T.clear(q_shared)
                 T.copy(
-                    KCache[physical_page, :, kv_head, :],
-                    k_shared,
+                    Q[
+                        batch,
+                        kv_head * group_size : (kv_head + 1) * group_size,
+                        :,
+                    ],
+                    q_shared[0:group_size, :],
                 )
-                T.copy(
-                    VCache[physical_page, :, kv_head, :],
-                    v_shared,
-                )
-                T.clear(score)
-                T.gemm(
-                    q_shared,
-                    k_shared,
-                    score,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
-                T.copy(score_max, previous_max)
+                T.clear(output)
+                T.clear(normalizer)
                 T.fill(score_max, -T.infinity(T.float32))
-                for row, token in T.Parallel(_BLOCK_H, page_size):
-                    score[row, token] = T.if_then_else(
-                        row < group_size
-                        and logical_page * page_size + token < SeqLens[batch],
-                        score[row, token],
-                        -T.infinity(T.float32),
-                    )
-                T.reduce_max(score, score_max, dim=1, clear=False)
-                for row in T.Parallel(_BLOCK_H):
-                    score_max[row] = T.max(score_max[row], previous_max[row])
-                    score_scale[row] = T.exp2(
-                        (previous_max[row] - score_max[row])
-                        * _LOG2E_OVER_SQRT_HEAD_DIM
-                    )
-                for row, token in T.Parallel(_BLOCK_H, page_size):
-                    score[row, token] = T.exp2(
-                        (score[row, token] - score_max[row])
-                        * _LOG2E_OVER_SQRT_HEAD_DIM
-                    )
-                T.reduce_sum(score, score_sum, dim=1)
-                T.copy(score, probability_shared)
-                for row in T.Parallel(_BLOCK_H):
-                    normalizer[row] = (
-                        normalizer[row] * score_scale[row] + score_sum[row]
-                    )
-                for row, dim in T.Parallel(_BLOCK_H, _HEAD_DIM):
-                    output[row, dim] *= score_scale[row]
-                T.gemm(
-                    probability_shared,
-                    v_shared,
-                    output,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
 
-            if split_page_count > 0:
+                start_page = split * pages_per_split
+                split_page_count = T.min(
+                    pages_per_split, page_count - start_page
+                )
+                for page_offset in T.Pipelined(
+                    split_page_count, num_stages=1
+                ):
+                    logical_page = start_page + page_offset
+                    physical_page = BlockTable[batch, logical_page]
+                    T.copy(
+                        KCache[physical_page, :, kv_head, :],
+                        k_shared,
+                    )
+                    T.copy(
+                        VCache[physical_page, :, kv_head, :],
+                        v_shared,
+                    )
+                    T.clear(score)
+                    T.gemm(
+                        q_shared,
+                        k_shared,
+                        score,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+                    T.copy(score_max, previous_max)
+                    T.fill(score_max, -T.infinity(T.float32))
+                    for row, token in T.Parallel(_BLOCK_H, page_size):
+                        score[row, token] = T.if_then_else(
+                            row < group_size
+                            and logical_page * page_size + token
+                            < SeqLens[batch],
+                            score[row, token],
+                            -T.infinity(T.float32),
+                        )
+                    T.reduce_max(score, score_max, dim=1, clear=False)
+                    for row in T.Parallel(_BLOCK_H):
+                        score_max[row] = T.max(
+                            score_max[row], previous_max[row]
+                        )
+                        score_scale[row] = T.exp2(
+                            (previous_max[row] - score_max[row])
+                            * _LOG2E_OVER_SQRT_HEAD_DIM
+                        )
+                    for row, token in T.Parallel(_BLOCK_H, page_size):
+                        score[row, token] = T.exp2(
+                            (score[row, token] - score_max[row])
+                            * _LOG2E_OVER_SQRT_HEAD_DIM
+                        )
+                    T.reduce_sum(score, score_sum, dim=1)
+                    T.copy(score, probability_shared)
+                    for row in T.Parallel(_BLOCK_H):
+                        normalizer[row] = (
+                            normalizer[row] * score_scale[row]
+                            + score_sum[row]
+                        )
+                    for row, dim in T.Parallel(_BLOCK_H, _HEAD_DIM):
+                        output[row, dim] *= score_scale[row]
+                    T.gemm(
+                        probability_shared,
+                        v_shared,
+                        output,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+
                 for row in T.Parallel(group_size):
                     LogSumExp[
                         batch, kv_head * group_size + row, split
@@ -279,15 +281,6 @@ def _compile_paged_gqa_split(
                     PartialOutput[
                         batch, kv_head * group_size + row, split, dim
                     ] = output[row, dim] / normalizer[row]
-            else:
-                for row in T.Parallel(group_size):
-                    LogSumExp[
-                        batch, kv_head * group_size + row, split
-                    ] = -T.infinity(T.float32)
-                for row, dim in T.Parallel(group_size, _HEAD_DIM):
-                    PartialOutput[
-                        batch, kv_head * group_size + row, split, dim
-                    ] = 0.0
 
     return kernel
 
@@ -302,6 +295,8 @@ def _compile_split_combine(
     num_q_heads: int,
     num_kv_heads: int,
     num_splits: int,
+    page_size: int,
+    pages_per_split: int,
 ):
     group_size = num_q_heads // num_kv_heads
 
@@ -313,6 +308,7 @@ def _compile_split_combine(
         LogSumExp: T.Tensor(
             (batch_size, num_q_heads, num_splits), T.float32
         ),
+        SeqLens: T.Tensor((batch_size,), T.int32),
         Output: T.Tensor(
             (batch_size, num_q_heads, _HEAD_DIM), T.bfloat16
         ),
@@ -328,7 +324,10 @@ def _compile_split_combine(
             T.clear(output)
             T.clear(lse_sum)
             T.fill(lse_max, -T.infinity(T.float32))
-            for split in T.serial(num_splits):
+            active_splits = T.ceildiv(
+                T.ceildiv(SeqLens[batch], page_size), pages_per_split
+            )
+            for split in T.serial(active_splits):
                 for row in T.Parallel(group_size):
                     lse_max[row] = T.max(
                         lse_max[row],
@@ -336,7 +335,7 @@ def _compile_split_combine(
                             batch, kv_head * group_size + row, split
                         ],
                     )
-            for split in T.serial(num_splits):
+            for split in T.serial(active_splits):
                 for row in T.Parallel(group_size):
                     split_weight[row] = T.exp2(
                         LogSumExp[
@@ -369,6 +368,7 @@ class Submission:
         num_q_heads = int(spec.num_q_heads)
         num_kv_heads = int(spec.num_kv_heads)
         max_seq_len = int(spec.max_seq_len)
+        page_size = int(spec.page_size)
         work_items = batch_size * num_kv_heads
         if max_seq_len >= 16384 and work_items <= 8:
             num_splits = 16
@@ -388,7 +388,7 @@ class Submission:
                     num_kv_heads,
                     int(spec.num_pages),
                     max_seq_len,
-                    int(spec.page_size),
+                    page_size,
                 ),
                 None,
                 0,
@@ -397,6 +397,8 @@ class Submission:
         partial_elements = (
             batch_size * num_q_heads * num_splits * _HEAD_DIM
         )
+        max_pages = (max_seq_len + page_size - 1) // page_size
+        pages_per_split = (max_pages + num_splits - 1) // num_splits
         required_bytes = 4 * (
             partial_elements + batch_size * num_q_heads * num_splits
         )
@@ -410,14 +412,17 @@ class Submission:
                 num_kv_heads,
                 int(spec.num_pages),
                 max_seq_len,
-                int(spec.page_size),
+                page_size,
                 num_splits,
+                pages_per_split,
             ),
             _compile_split_combine(
                 batch_size,
                 num_q_heads,
                 num_kv_heads,
                 num_splits,
+                page_size,
+                pages_per_split,
             ),
             partial_elements,
         )
@@ -456,4 +461,4 @@ class Submission:
             partial_output,
             log_sum_exp,
         )
-        combine(partial_output, log_sum_exp, out)
+        combine(partial_output, log_sum_exp, seq_lens, out)
