@@ -7,7 +7,7 @@
 
 namespace {
 
-constexpr int kPivotBlock = 64;
+constexpr int kPivotBlock = 128;
 
 __global__ void AddDiagonalAndMask(std::uint64_t *reach, int vertices,
                                    int words) {
@@ -23,26 +23,46 @@ __global__ void AddDiagonalAndMask(std::uint64_t *reach, int vertices,
 __global__ void ClosePivotBlock(const std::uint64_t *reach,
                                 std::uint64_t *pivot_masks, int words,
                                 int block_start, int block_size) {
-  __shared__ std::uint64_t current_pivot;
+  __shared__ std::uint64_t current_pivot[2];
   const int row = threadIdx.x;
-  std::uint64_t row_mask = 0;
+  std::uint64_t row_mask0 = 0;
+  std::uint64_t row_mask1 = 0;
   if (row < block_size) {
-    row_mask = reach[static_cast<std::size_t>(block_start + row) * words +
-                     block_start / kPivotBlock];
-    row_mask &= block_size == kPivotBlock
-                    ? ~0ULL
-                    : (1ULL << block_size) - 1ULL;
-    row_mask |= 1ULL << row;
+    const std::size_t base =
+        static_cast<std::size_t>(block_start + row) * words;
+    const int block_word = block_start / 64;
+    row_mask0 = reach[base + block_word];
+    if (block_size > 64) row_mask1 = reach[base + block_word + 1];
+    if (block_size < 64)
+      row_mask0 &= (1ULL << block_size) - 1ULL;
+    if (block_size > 64 && block_size < kPivotBlock)
+      row_mask1 &= (1ULL << (block_size - 64)) - 1ULL;
+    if (row < 64) {
+      row_mask0 |= 1ULL << row;
+    } else {
+      row_mask1 |= 1ULL << (row - 64);
+    }
   }
 
   for (int pivot = 0; pivot < block_size; ++pivot) {
-    if (row == pivot) current_pivot = row_mask;
+    if (row == pivot) {
+      current_pivot[0] = row_mask0;
+      current_pivot[1] = row_mask1;
+    }
     __syncthreads();
-    if (row < block_size && (row_mask & (1ULL << pivot)) != 0)
-      row_mask |= current_pivot;
+    const bool has_pivot =
+        pivot < 64 ? (row_mask0 & (1ULL << pivot)) != 0
+                   : (row_mask1 & (1ULL << (pivot - 64))) != 0;
+    if (row < block_size && has_pivot) {
+      row_mask0 |= current_pivot[0];
+      row_mask1 |= current_pivot[1];
+    }
     __syncthreads();
   }
-  if (row < block_size) pivot_masks[row] = row_mask;
+  if (row < block_size) {
+    pivot_masks[2 * row] = row_mask0;
+    pivot_masks[2 * row + 1] = row_mask1;
+  }
 }
 
 __global__ void BuildPivotRows(const std::uint64_t *reach,
@@ -51,15 +71,24 @@ __global__ void BuildPivotRows(const std::uint64_t *reach,
                                int block_start, int block_size) {
   const int row = blockIdx.x;
   if (row >= block_size) return;
-  const std::uint64_t mask = pivot_masks[row];
+  const std::uint64_t mask0 = pivot_masks[2 * row];
+  const std::uint64_t mask1 = pivot_masks[2 * row + 1];
   for (int word = threadIdx.x; word < words; word += blockDim.x) {
     std::uint64_t output = 0;
-    std::uint64_t remaining = mask;
-    while (remaining != 0) {
-      const int source = __ffsll(static_cast<long long>(remaining)) - 1;
+    std::uint64_t remaining0 = mask0;
+    while (remaining0 != 0) {
+      const int source = __ffsll(static_cast<long long>(remaining0)) - 1;
       output |= reach[static_cast<std::size_t>(block_start + source) * words +
                       word];
-      remaining &= remaining - 1;
+      remaining0 &= remaining0 - 1;
+    }
+    std::uint64_t remaining1 = mask1;
+    while (remaining1 != 0) {
+      const int source =
+          64 + __ffsll(static_cast<long long>(remaining1)) - 1;
+      output |= reach[static_cast<std::size_t>(block_start + source) * words +
+                      word];
+      remaining1 &= remaining1 - 1;
     }
     pivot_rows[static_cast<std::size_t>(row) * words + word] = output;
   }
@@ -74,27 +103,49 @@ __global__ void ApplyPivotBlock(std::uint64_t *reach,
   const int row = blockIdx.x;
   if (row >= vertices) return;
   const std::size_t base = static_cast<std::size_t>(row) * words;
-  std::uint64_t row_mask = reach[base + block_start / kPivotBlock];
-  row_mask &= block_size == kPivotBlock
-                  ? ~0ULL
-                  : (1ULL << block_size) - 1ULL;
+  const int block_word = block_start / 64;
+  std::uint64_t row_mask0 = reach[base + block_word];
+  std::uint64_t row_mask1 =
+      block_size > 64 ? reach[base + block_word + 1] : 0;
+  if (block_size < 64)
+    row_mask0 &= (1ULL << block_size) - 1ULL;
+  if (block_size > 64 && block_size < kPivotBlock)
+    row_mask1 &= (1ULL << (block_size - 64)) - 1ULL;
   if constexpr (SkipEmpty) {
-    if (row_mask == 0) return;
+    if ((row_mask0 | row_mask1) == 0) return;
   }
-  std::uint64_t selected_mask = 0;
+  std::uint64_t selected_mask0 = 0;
+  std::uint64_t selected_mask1 = 0;
   if ((threadIdx.x & 31) == 0) {
-    std::uint64_t remaining = row_mask;
-    while (remaining != 0) {
-      const int source = __ffsll(static_cast<long long>(remaining)) - 1;
-      selected_mask |= 1ULL << source;
-      remaining &= ~pivot_masks[source];
+    std::uint64_t remaining0 = row_mask0;
+    std::uint64_t remaining1 = row_mask1;
+    while ((remaining0 | remaining1) != 0) {
+      int source;
+      if (remaining0 != 0) {
+        source = __ffsll(static_cast<long long>(remaining0)) - 1;
+        selected_mask0 |= 1ULL << source;
+      } else {
+        source = 64 + __ffsll(static_cast<long long>(remaining1)) - 1;
+        selected_mask1 |= 1ULL << (source - 64);
+      }
+      remaining0 &= ~pivot_masks[2 * source];
+      remaining1 &= ~pivot_masks[2 * source + 1];
     }
   }
-  selected_mask = __shfl_sync(0xffffffffU, selected_mask, 0);
-  if (selected_mask == 0) return;
+  selected_mask0 = __shfl_sync(0xffffffffU, selected_mask0, 0);
+  selected_mask1 = __shfl_sync(0xffffffffU, selected_mask1, 0);
+  if ((selected_mask0 | selected_mask1) == 0) return;
 
-  if ((selected_mask & (selected_mask - 1)) == 0) {
-    const int source = __ffsll(static_cast<long long>(selected_mask)) - 1;
+  const bool single_generator =
+      (selected_mask1 == 0 &&
+       (selected_mask0 & (selected_mask0 - 1)) == 0) ||
+      (selected_mask0 == 0 &&
+       (selected_mask1 & (selected_mask1 - 1)) == 0);
+  if (single_generator) {
+    const int source =
+        selected_mask0 != 0
+            ? __ffsll(static_cast<long long>(selected_mask0)) - 1
+            : 64 + __ffsll(static_cast<long long>(selected_mask1)) - 1;
     for (int word = threadIdx.x; word < words; word += blockDim.x) {
       const std::uint64_t input = reach[base + word];
       const std::uint64_t output =
@@ -108,11 +159,18 @@ __global__ void ApplyPivotBlock(std::uint64_t *reach,
   for (int word = threadIdx.x; word < words; word += blockDim.x) {
     const std::uint64_t input = reach[base + word];
     std::uint64_t output = input;
-    std::uint64_t remaining = selected_mask;
-    while (remaining != 0) {
-      const int source = __ffsll(static_cast<long long>(remaining)) - 1;
+    std::uint64_t remaining0 = selected_mask0;
+    while (remaining0 != 0) {
+      const int source = __ffsll(static_cast<long long>(remaining0)) - 1;
       output |= pivot_rows[static_cast<std::size_t>(source) * words + word];
-      remaining &= remaining - 1;
+      remaining0 &= remaining0 - 1;
+    }
+    std::uint64_t remaining1 = selected_mask1;
+    while (remaining1 != 0) {
+      const int source =
+          64 + __ffsll(static_cast<long long>(remaining1)) - 1;
+      output |= pivot_rows[static_cast<std::size_t>(source) * words + word];
+      remaining1 &= remaining1 - 1;
     }
     if (output != input) reach[base + word] = output;
   }
