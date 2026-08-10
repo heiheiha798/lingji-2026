@@ -16,7 +16,7 @@ constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr int kThreads = 256;
 constexpr int kRowThreads = 64;
 constexpr int kEmitWarps = 2;
-constexpr std::uint32_t kImplementationId = 10;
+constexpr std::uint32_t kImplementationId = 11;
 
 __device__ __constant__ std::int8_t g_triangle_table[256][16];
 __device__ __constant__ std::uint8_t g_triangle_count[256];
@@ -265,15 +265,125 @@ __global__ void generate_triangles_by_row(
 
     if (count != 0 &&
         static_cast<std::uint64_t>(offset) + count <= capacity) {
-      float values[8];
-      icecarver::mc::load_corners(volume, nx, ny, x, y, z, values);
+      const std::size_t unx = static_cast<std::size_t>(nx);
+      const std::size_t volume_row = unx;
+      const std::size_t volume_plane =
+          unx * static_cast<std::size_t>(ny);
+      const std::size_t base =
+          (static_cast<std::size_t>(z) * static_cast<std::size_t>(ny) +
+           static_cast<std::size_t>(y)) *
+              unx +
+          static_cast<std::size_t>(x);
+      const float v0 = volume[base];
+      const float v1 = volume[base + 1];
+      const float v2 = volume[base + volume_row + 1];
+      const float v3 = volume[base + volume_row];
+      const float v4 = volume[base + volume_plane];
+      const float v5 = volume[base + volume_plane + 1];
+      const float v6 = volume[base + volume_plane + volume_row + 1];
+      const float v7 = volume[base + volume_plane + volume_row];
       const float isovalue = isovalues[iso];
-      const std::uint8_t cube_case =
-          icecarver::mc::case_index(values, isovalue);
+      const std::uint8_t cube_case = static_cast<std::uint8_t>(
+          (static_cast<unsigned int>(v0 < isovalue) << 0) |
+          (static_cast<unsigned int>(v1 < isovalue) << 1) |
+          (static_cast<unsigned int>(v2 < isovalue) << 2) |
+          (static_cast<unsigned int>(v3 < isovalue) << 3) |
+          (static_cast<unsigned int>(v4 < isovalue) << 4) |
+          (static_cast<unsigned int>(v5 < isovalue) << 5) |
+          (static_cast<unsigned int>(v6 < isovalue) << 6) |
+          (static_cast<unsigned int>(v7 < isovalue) << 7));
       const std::int8_t* row = g_triangle_table[cube_case];
+      const float fx = static_cast<float>(x);
+      const float fy = static_cast<float>(y);
+      const float fz = static_cast<float>(z);
+      const auto interpolate_edge = [&](int edge, float& px, float& py,
+                                        float& pz) {
+        float t = 0.0f;
+        switch (edge) {
+          case 0:
+            t = (isovalue - v0) / (v1 - v0);
+            px = fx + t;
+            py = fy;
+            pz = fz;
+            break;
+          case 1:
+            t = (isovalue - v1) / (v2 - v1);
+            px = fx + 1.0f;
+            py = fy + t;
+            pz = fz;
+            break;
+          case 2:
+            t = (isovalue - v2) / (v3 - v2);
+            px = fx + 1.0f - t;
+            py = fy + 1.0f;
+            pz = fz;
+            break;
+          case 3:
+            t = (isovalue - v3) / (v0 - v3);
+            px = fx;
+            py = fy + 1.0f - t;
+            pz = fz;
+            break;
+          case 4:
+            t = (isovalue - v4) / (v5 - v4);
+            px = fx + t;
+            py = fy;
+            pz = fz + 1.0f;
+            break;
+          case 5:
+            t = (isovalue - v5) / (v6 - v5);
+            px = fx + 1.0f;
+            py = fy + t;
+            pz = fz + 1.0f;
+            break;
+          case 6:
+            t = (isovalue - v6) / (v7 - v6);
+            px = fx + 1.0f - t;
+            py = fy + 1.0f;
+            pz = fz + 1.0f;
+            break;
+          case 7:
+            t = (isovalue - v7) / (v4 - v7);
+            px = fx;
+            py = fy + 1.0f - t;
+            pz = fz + 1.0f;
+            break;
+          case 8:
+            t = (isovalue - v0) / (v4 - v0);
+            px = fx;
+            py = fy;
+            pz = fz + t;
+            break;
+          case 9:
+            t = (isovalue - v1) / (v5 - v1);
+            px = fx + 1.0f;
+            py = fy;
+            pz = fz + t;
+            break;
+          case 10:
+            t = (isovalue - v2) / (v6 - v2);
+            px = fx + 1.0f;
+            py = fy + 1.0f;
+            pz = fz + t;
+            break;
+          default:
+            t = (isovalue - v3) / (v7 - v3);
+            px = fx;
+            py = fy + 1.0f;
+            pz = fz + t;
+            break;
+        }
+      };
       for (std::uint32_t triangle = 0; triangle < count; ++triangle) {
-        triangles[offset + triangle] = icecarver::mc::make_triangle(
-            row, static_cast<int>(triangle), x, y, z, values, isovalue);
+        icecarver::Triangle output_triangle;
+        const int first = 3 * static_cast<int>(triangle);
+        interpolate_edge(row[first], output_triangle.x0, output_triangle.y0,
+                         output_triangle.z0);
+        interpolate_edge(row[first + 1], output_triangle.x1,
+                         output_triangle.y1, output_triangle.z1);
+        interpolate_edge(row[first + 2], output_triangle.x2,
+                         output_triangle.y2, output_triangle.z2);
+        triangles[offset + triangle] = output_triangle;
       }
     }
     row_prefix += __shfl_sync(0xffffffffU, inclusive, 31);
