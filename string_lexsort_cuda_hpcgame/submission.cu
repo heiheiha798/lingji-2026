@@ -85,28 +85,65 @@ __global__ void merge_pass(
     int32_t n,
     int32_t width,
     int32_t run_length) {
-  const int32_t output_index =
-      static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (output_index >= n) {
-    return;
-  }
+  __shared__ int32_t tile[kThreads];
+  __shared__ int32_t block_partitions[2];
 
+  const int32_t lane = static_cast<int32_t>(threadIdx.x);
+  const int32_t block_begin = static_cast<int32_t>(blockIdx.x * kThreads);
   const int32_t pair_length = run_length << 1;
-  const int32_t pair_begin = (output_index / pair_length) * pair_length;
+  const int32_t pair_begin = (block_begin / pair_length) * pair_length;
   const int32_t left_length = min(run_length, n - pair_begin);
   const int32_t right_begin = pair_begin + left_length;
   const int32_t right_length = min(run_length, n - right_begin);
-  const int32_t diagonal = output_index - pair_begin;
+  const int32_t block_diagonal = block_begin - pair_begin;
+  const int32_t output_count = min(kThreads, n - block_begin);
 
-  int32_t low = max(0, diagonal - right_length);
-  int32_t high = min(diagonal, left_length);
+  if (lane < 2) {
+    const int32_t diagonal = block_diagonal + lane * output_count;
+    int32_t low = max(0, diagonal - right_length);
+    int32_t high = min(diagonal, left_length);
+    while (low < high) {
+      const int32_t left = (low + high) >> 1;
+      const int32_t right = diagonal - left;
+      if (left < left_length && right > 0 &&
+          index_less(
+              source[pair_begin + left],
+              source[right_begin + right - 1],
+              strings,
+              width)) {
+        low = left + 1;
+      } else {
+        high = left;
+      }
+    }
+    block_partitions[lane] = low;
+  }
+  __syncthreads();
+
+  const int32_t left_begin = block_partitions[0];
+  const int32_t left_count = block_partitions[1] - left_begin;
+  const int32_t right_offset = block_diagonal - left_begin;
+  const int32_t right_count = output_count - left_count;
+  if (lane < left_count) {
+    tile[lane] = source[pair_begin + left_begin + lane];
+  } else if (lane < output_count) {
+    tile[lane] = source[right_begin + right_offset + lane - left_count];
+  }
+  __syncthreads();
+
+  if (lane >= output_count) {
+    return;
+  }
+
+  int32_t low = max(0, lane - right_count);
+  int32_t high = min(lane, left_count);
   while (low < high) {
     const int32_t left = (low + high) >> 1;
-    const int32_t right = diagonal - left;
-    if (left < left_length && right > 0 &&
+    const int32_t right = lane - left;
+    if (left < left_count && right > 0 &&
         index_less(
-            source[pair_begin + left],
-            source[right_begin + right - 1],
+            tile[left],
+            tile[left_count + right - 1],
             strings,
             width)) {
       low = left + 1;
@@ -116,17 +153,17 @@ __global__ void merge_pass(
   }
 
   const int32_t left = low;
-  const int32_t right = diagonal - left;
-  if (left < left_length &&
-      (right >= right_length ||
+  const int32_t right = lane - left;
+  if (left < left_count &&
+      (right >= right_count ||
        index_less(
-           source[pair_begin + left],
-           source[right_begin + right],
+           tile[left],
+           tile[left_count + right],
            strings,
            width))) {
-    destination[output_index] = source[pair_begin + left];
+    destination[block_begin + lane] = tile[left];
   } else {
-    destination[output_index] = source[right_begin + right];
+    destination[block_begin + lane] = tile[left_count + right];
   }
 }
 
