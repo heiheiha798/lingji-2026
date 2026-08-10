@@ -37,7 +37,7 @@ from fla.ops.utils.constant import RCP_LN2
     pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
 )
 def _chunk_state(B, S):
-    H, K, V, BT, BV = 8, 128, 128, 64, 32
+    H, K, V, BT, BV = 8, 128, 128, 64, 16
 
     @T.prim_func
     def kernel(
