@@ -13,8 +13,8 @@ struct DeviceResources {
   std::uint32_t *initial = nullptr;
   std::uint8_t *stable = nullptr;
   std::uint64_t *odometer = nullptr;
-  std::uint64_t *height_a = nullptr;
-  std::uint64_t *height_b = nullptr;
+  std::uint32_t *height_a = nullptr;
+  std::uint32_t *height_b = nullptr;
   int *active = nullptr;
   cudaStream_t stream = nullptr;
 
@@ -48,8 +48,8 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
       !CudaOk(cudaMalloc(&d.initial, n * sizeof(std::uint32_t))) ||
       !CudaOk(cudaMalloc(&d.stable, n * sizeof(std::uint8_t))) ||
       !CudaOk(cudaMalloc(&d.odometer, n * sizeof(std::uint64_t))) ||
-      !CudaOk(cudaMalloc(&d.height_a, n * sizeof(std::uint64_t))) ||
-      !CudaOk(cudaMalloc(&d.height_b, n * sizeof(std::uint64_t))) ||
+      !CudaOk(cudaMalloc(&d.height_a, n * sizeof(std::uint32_t))) ||
+      !CudaOk(cudaMalloc(&d.height_b, n * sizeof(std::uint32_t))) ||
       !CudaOk(cudaMalloc(&d.active, sizeof(int))) ||
       !CudaOk(cudaMemcpyAsync(d.initial, initial, n * sizeof(std::uint32_t),
                               cudaMemcpyHostToDevice, d.stream))) {
@@ -68,9 +68,9 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
     if (!CudaOk(cudaMemsetAsync(d.active, 0, sizeof(int), d.stream))) {
       return 2;
     }
-    for (int sweep = 0; sweep < 8; ++sweep) {
+    for (int sweep = 0; sweep < 16; ++sweep) {
       LaunchSweep(a, b, d.odometer, rows, cols,
-                  sweep == 7 ? d.active : nullptr, d.stream);
+                  sweep == 15 ? d.active : nullptr, d.stream);
       if (!CudaOk(cudaGetLastError())) {
         return 2;
       }

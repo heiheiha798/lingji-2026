@@ -5,7 +5,7 @@
 namespace {
 
 __global__ void InitializeKernel(const std::uint32_t *input,
-                                 std::uint64_t *height,
+                                 std::uint32_t *height,
                                  std::uint64_t *odometer, std::size_t n) {
   const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -16,8 +16,8 @@ __global__ void InitializeKernel(const std::uint32_t *input,
 }
 
 template <bool CheckActive>
-__global__ void SweepKernel(const std::uint64_t *__restrict__ input,
-                            std::uint64_t *__restrict__ output,
+__global__ void SweepKernel(const std::uint32_t *__restrict__ input,
+                            std::uint32_t *__restrict__ output,
                             std::uint64_t *__restrict__ odometer, int rows,
                             int cols, int *active) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -25,9 +25,9 @@ __global__ void SweepKernel(const std::uint64_t *__restrict__ input,
   if (x >= cols || y >= rows) return;
 
   const std::size_t i = static_cast<std::size_t>(y) * cols + x;
-  const std::uint64_t h = input[i];
-  const std::uint64_t q = h >> 2;
-  std::uint64_t next = h & 3U;
+  const std::uint32_t h = input[i];
+  const std::uint32_t q = h >> 2;
+  std::uint32_t next = h & 3U;
   if (x > 0) next += input[i - 1] >> 2;
   if (x + 1 < cols) next += input[i + 1] >> 2;
   if (y > 0) next += input[i - cols] >> 2;
@@ -41,7 +41,7 @@ __global__ void SweepKernel(const std::uint64_t *__restrict__ input,
   }
 }
 
-__global__ void StoreKernel(const std::uint64_t *height,
+__global__ void StoreKernel(const std::uint32_t *height,
                             std::uint8_t *stable, std::size_t n) {
   const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -50,14 +50,14 @@ __global__ void StoreKernel(const std::uint64_t *height,
 
 }  // namespace
 
-void LaunchInitialize(const std::uint32_t *input, std::uint64_t *height,
+void LaunchInitialize(const std::uint32_t *input, std::uint32_t *height,
                       std::uint64_t *odometer, std::size_t n,
                       cudaStream_t stream) {
   InitializeKernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(
       input, height, odometer, n);
 }
 
-void LaunchSweep(const std::uint64_t *input, std::uint64_t *output,
+void LaunchSweep(const std::uint32_t *input, std::uint32_t *output,
                  std::uint64_t *odometer, int rows, int cols, int *active,
                  cudaStream_t stream) {
   const dim3 block(32, 8);
@@ -72,7 +72,7 @@ void LaunchSweep(const std::uint64_t *input, std::uint64_t *output,
   }
 }
 
-void LaunchStore(const std::uint64_t *height, std::uint8_t *stable,
+void LaunchStore(const std::uint32_t *height, std::uint8_t *stable,
                  std::size_t n, cudaStream_t stream) {
   StoreKernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(
       height, stable, n);
