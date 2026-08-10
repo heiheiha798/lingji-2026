@@ -219,7 +219,7 @@ __global__ void generate_triangles(
   }
 }
 
-__global__ void generate_triangles_by_row(
+__global__ __launch_bounds__(kRowThreads, 16) void generate_triangles_by_row(
     const float* __restrict__ volume, int nx, int ny, int cx, int cy,
     std::uint32_t num_rows, const float* __restrict__ isovalues,
     const std::uint8_t* __restrict__ counts,
