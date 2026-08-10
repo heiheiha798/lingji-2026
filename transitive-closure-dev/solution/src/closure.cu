@@ -218,6 +218,100 @@ __global__ void CopyOrderedBlockRows(std::uint64_t *reach,
       reach[static_cast<std::size_t>(representative) * words + word];
 }
 
+__global__ void CloseOrderedBlocksCooperative(
+    std::uint64_t *reach, std::uint64_t *block_rows,
+    const int *representatives, int *global_neighbor_counts,
+    int *global_neighbors, int vertices, int words, int neighbor_capacity) {
+  __shared__ int neighbor_count;
+  const cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+  const int row_offset = blockIdx.x;
+  const int word_tile = blockIdx.y;
+  const int word_tiles = gridDim.y;
+  for (int block_start =
+           ((vertices - 1) / kOrderedBlockSize) * kOrderedBlockSize;
+       block_start >= 0; block_start -= kOrderedBlockSize) {
+    const int block_size =
+        min(kOrderedBlockSize, vertices - block_start);
+    const bool active = row_offset < block_size;
+    const int row = block_start + row_offset;
+    const bool representative =
+        active && representatives[row] == row;
+    if (representative) {
+      std::uint64_t internal_mask =
+          reach[static_cast<std::size_t>(row) * words + block_start / 64];
+      for (int word = word_tile * blockDim.x + threadIdx.x; word < words;
+           word += word_tiles * blockDim.x) {
+        std::uint64_t remaining = internal_mask;
+        std::uint64_t output = 0;
+        while (remaining != 0) {
+          const int source = __ffsll(static_cast<long long>(remaining)) - 1;
+          output |=
+              reach[static_cast<std::size_t>(block_start + source) * words +
+                    word];
+          remaining &= remaining - 1;
+        }
+        block_rows[static_cast<std::size_t>(row_offset) * words + word] =
+            output;
+      }
+    }
+    grid.sync();
+
+    if (word_tile == 0) {
+      if (threadIdx.x == 0) neighbor_count = 0;
+      __syncthreads();
+      if (representative) {
+        const std::size_t scratch_base =
+            static_cast<std::size_t>(row_offset) * words;
+        for (int word = block_start / 64 + 1 + threadIdx.x; word < words;
+             word += blockDim.x) {
+          std::uint64_t remaining = block_rows[scratch_base + word];
+          while (remaining != 0) {
+            const int bit = __ffsll(static_cast<long long>(remaining)) - 1;
+            const int position = atomicAdd(&neighbor_count, 1);
+            global_neighbors[row_offset * neighbor_capacity + position] =
+                word * 64 + bit;
+            remaining &= remaining - 1;
+          }
+        }
+      }
+      __syncthreads();
+      if (threadIdx.x == 0 && representative)
+        global_neighbor_counts[row_offset] = neighbor_count;
+    }
+    grid.sync();
+
+    if (representative) {
+      const std::size_t scratch_base =
+          static_cast<std::size_t>(row_offset) * words;
+      const std::size_t output_base = static_cast<std::size_t>(row) * words;
+      const int count = global_neighbor_counts[row_offset];
+      for (int word = word_tile * blockDim.x + threadIdx.x; word < words;
+           word += word_tiles * blockDim.x) {
+        std::uint64_t output = block_rows[scratch_base + word];
+        for (int index = 0; index < count; ++index) {
+          output |= reach[static_cast<std::size_t>(
+                              global_neighbors[row_offset * neighbor_capacity +
+                                               index]) *
+                              words +
+                          word];
+        }
+        reach[output_base + word] = output;
+      }
+    }
+    grid.sync();
+
+    if (active && !representative) {
+      const int source_row = representatives[row];
+      for (int word = word_tile * blockDim.x + threadIdx.x; word < words;
+           word += word_tiles * blockDim.x) {
+        reach[static_cast<std::size_t>(row) * words + word] =
+            reach[static_cast<std::size_t>(source_row) * words + word];
+      }
+    }
+    grid.sync();
+  }
+}
+
 __global__ void CloseUpperTriangularDag(std::uint64_t *reach,
                                         int *neighbors, int vertices,
                                         int words) {
@@ -398,14 +492,31 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   bool use_parallel_dag_batches = false;
   bool use_cooperative_dag_batches = false;
   bool use_ordered_block_closure = false;
+  bool use_cooperative_ordered_blocks = false;
   int maximum_dag_batch_size = 0;
   constexpr int kPivotBlock = 256;
   const std::size_t pivot_bytes = static_cast<std::size_t>(kPivotBlock) *
                                   words_per_row * sizeof(std::uint64_t);
+  const int ordered_neighbor_capacity =
+      vertices < kOrderedBlockNeighborCapacity
+          ? vertices
+          : kOrderedBlockNeighborCapacity;
+  const std::size_t ordered_scratch_bytes =
+      static_cast<std::size_t>(vertices) * sizeof(int) +
+      static_cast<std::size_t>(kOrderedBlockSize) * words_per_row *
+          sizeof(std::uint64_t) +
+      static_cast<std::size_t>(kOrderedBlockSize) * sizeof(int) +
+      static_cast<std::size_t>(kOrderedBlockSize) *
+          ordered_neighbor_capacity * sizeof(int) +
+      sizeof(std::uint64_t);
+  const std::size_t pivot_allocation_bytes =
+      ordered_block_candidate && ordered_scratch_bytes > pivot_bytes
+          ? ordered_scratch_bytes
+          : pivot_bytes;
   DeviceResources d;
   if (!CudaOk(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking)) ||
       !CudaOk(cudaMalloc(&d.reachability, bytes)) ||
-      !CudaOk(cudaMalloc(&d.pivot_rows, pivot_bytes)) ||
+      !CudaOk(cudaMalloc(&d.pivot_rows, pivot_allocation_bytes)) ||
       !CudaOk(cudaMalloc(&d.pivot_masks,
                          (4 * kPivotBlock + 1) *
                              sizeof(std::uint64_t)))) {
@@ -471,6 +582,28 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
     use_ordered_block_closure =
         ordered_block_candidate &&
         maximum_degree <= kOrderedBlockMaximumDegree;
+    if (use_ordered_block_closure && !use_dag_closure) {
+      int device = 0;
+      int cooperative_launch = 0;
+      int multiprocessors = 0;
+      int active_blocks_per_multiprocessor = 0;
+      if (!CudaOk(cudaGetDevice(&device)) ||
+          !CudaOk(cudaDeviceGetAttribute(
+              &cooperative_launch, cudaDevAttrCooperativeLaunch, device)) ||
+          !CudaOk(cudaDeviceGetAttribute(
+              &multiprocessors, cudaDevAttrMultiProcessorCount, device)) ||
+          !CudaOk(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &active_blocks_per_multiprocessor,
+              CloseOrderedBlocksCooperative, 256, 0))) {
+        return 2;
+      }
+      const int cooperative_blocks =
+          kOrderedBlockSize * ((words_per_row + 255) / 256);
+      use_cooperative_ordered_blocks =
+          cooperative_launch != 0 &&
+          cooperative_blocks <=
+              active_blocks_per_multiprocessor * multiprocessors;
+    }
     if (use_dag_closure &&
         maximum_degree <= kDagBatchNeighborCapacity) {
       int batch_end = vertices;
@@ -561,27 +694,53 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
          sizeof(std::uint64_t) - 1) /
         sizeof(std::uint64_t);
     std::uint64_t *block_rows = d.pivot_rows + representative_words;
+    int *global_neighbor_counts = reinterpret_cast<int *>(
+        block_rows +
+        static_cast<std::size_t>(kOrderedBlockSize) * words_per_row);
+    int *global_neighbors = global_neighbor_counts + kOrderedBlockSize;
     CloseOrderedDiagonalBlocks<<<
         (vertices + kOrderedBlockSize - 1) / kOrderedBlockSize,
         kOrderedBlockSize, 0, d.stream>>>(
         d.reachability, representatives, vertices, words_per_row);
-    for (int block_start =
-             ((vertices - 1) / kOrderedBlockSize) * kOrderedBlockSize;
-         block_start >= 0; block_start -= kOrderedBlockSize) {
-      const int remaining = vertices - block_start;
-      const int block_size =
-          remaining < kOrderedBlockSize ? remaining : kOrderedBlockSize;
-      BuildOrderedBlockRows<<<
-          dim3(block_size, (words_per_row + 127) / 128), 128, 0,
-          d.stream>>>(d.reachability, block_rows, representatives,
-                      words_per_row, block_start, block_size);
-      CloseOrderedBlockRows<<<block_size, 256, 0, d.stream>>>(
-          d.reachability, block_rows, representatives, words_per_row,
-          block_start, block_size);
-      CopyOrderedBlockRows<<<
-          dim3(block_size, (words_per_row + 255) / 256), 256, 0,
-          d.stream>>>(d.reachability, representatives, words_per_row,
-                      block_start, block_size);
+    if (use_cooperative_ordered_blocks) {
+      std::uint64_t *reach_argument = d.reachability;
+      std::uint64_t *block_rows_argument = block_rows;
+      const int *representatives_argument = representatives;
+      int *neighbor_counts_argument = global_neighbor_counts;
+      int *neighbors_argument = global_neighbors;
+      int vertices_argument = vertices;
+      int words_argument = words_per_row;
+      int neighbor_capacity_argument = ordered_neighbor_capacity;
+      void *arguments[] = {
+          &reach_argument,          &block_rows_argument,
+          &representatives_argument, &neighbor_counts_argument,
+          &neighbors_argument,      &vertices_argument,
+          &words_argument,          &neighbor_capacity_argument};
+      if (!CudaOk(cudaLaunchCooperativeKernel(
+              CloseOrderedBlocksCooperative,
+              dim3(kOrderedBlockSize, (words_per_row + 255) / 256),
+              dim3(256), arguments, 0, d.stream))) {
+        return 2;
+      }
+    } else {
+      for (int block_start =
+               ((vertices - 1) / kOrderedBlockSize) * kOrderedBlockSize;
+           block_start >= 0; block_start -= kOrderedBlockSize) {
+        const int remaining = vertices - block_start;
+        const int block_size =
+            remaining < kOrderedBlockSize ? remaining : kOrderedBlockSize;
+        BuildOrderedBlockRows<<<
+            dim3(block_size, (words_per_row + 127) / 128), 128, 0,
+            d.stream>>>(d.reachability, block_rows, representatives,
+                        words_per_row, block_start, block_size);
+        CloseOrderedBlockRows<<<block_size, 256, 0, d.stream>>>(
+            d.reachability, block_rows, representatives, words_per_row,
+            block_start, block_size);
+        CopyOrderedBlockRows<<<
+            dim3(block_size, (words_per_row + 255) / 256), 256, 0,
+            d.stream>>>(d.reachability, representatives, words_per_row,
+                        block_start, block_size);
+      }
     }
   } else {
     const int pivot_stride = words_per_row <= 512 ? kPivotBlock : 128;
