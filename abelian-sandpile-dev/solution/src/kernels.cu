@@ -81,8 +81,18 @@ __global__ void SweepKernel(const Height *__restrict__ input,
   output[i] = static_cast<Height>(next);
   if (q != 0) {
     odometer[i] += q;
-    if constexpr (CheckActive) {
-      atomicExch(active, 1);
+  }
+  if constexpr (CheckActive) {
+    if constexpr (Bounded) {
+      if (q != 0) atomicExch(active, 1);
+    } else {
+      const unsigned int active_lanes = __activemask();
+      const unsigned int unstable_lanes =
+          __ballot_sync(active_lanes, q != 0);
+      if (unstable_lanes != 0U &&
+          (threadIdx.x & 31) == __ffs(unstable_lanes) - 1) {
+        atomicExch(active, 1);
+      }
     }
   }
 }
