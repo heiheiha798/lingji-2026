@@ -16,7 +16,7 @@ constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr int kThreads = 256;
 constexpr int kRowThreads = 64;
 constexpr int kEmitWarps = 2;
-constexpr std::uint32_t kImplementationId = 11;
+constexpr std::uint32_t kImplementationId = 12;
 
 __device__ __constant__ std::int8_t g_triangle_table[256][16];
 __device__ __constant__ std::uint8_t g_triangle_count[256];
@@ -221,14 +221,13 @@ __global__ void generate_triangles(
 
 __global__ void generate_triangles_by_row(
     const float* __restrict__ volume, int nx, int ny, int cx, int cy,
-    std::uint32_t num_rows, const float* __restrict__ isovalues, int iso,
+    std::uint32_t num_rows, const float* __restrict__ isovalues,
     const std::uint8_t* __restrict__ counts,
     const std::uint32_t* __restrict__ row_offsets,
-    const std::uint64_t* __restrict__ totals,
-    icecarver::Triangle* __restrict__ triangles, std::uint64_t capacity) {
-  if (totals[iso] > capacity) {
-    return;
-  }
+    icecarver::Output output) {
+  __shared__ std::uint32_t
+      warp_prefixes[kEmitWarps][icecarver::kMaxIsovalues];
+
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const std::uint32_t row_id = blockIdx.x * kEmitWarps + warp;
@@ -237,34 +236,48 @@ __global__ void generate_triangles_by_row(
   }
   int y = 0;
   int z = 0;
-  std::uint32_t row_prefix = 0;
+  std::uint32_t valid_isovalues = 0;
   if (lane == 0) {
     y = static_cast<int>(row_id % static_cast<std::uint32_t>(cy));
     z = static_cast<int>(row_id / static_cast<std::uint32_t>(cy));
-    row_prefix = row_offsets[row_id];
+#pragma unroll
+    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+      warp_prefixes[warp][iso] =
+          row_offsets[static_cast<std::size_t>(iso) * num_rows + row_id];
+      valid_isovalues |= static_cast<std::uint32_t>(
+                             output.triangle_counts[iso] <=
+                             output.capacities[iso])
+                         << iso;
+    }
   }
   y = __shfl_sync(0xffffffffU, y, 0);
   z = __shfl_sync(0xffffffffU, z, 0);
-  row_prefix = __shfl_sync(0xffffffffU, row_prefix, 0);
+  valid_isovalues = __shfl_sync(0xffffffffU, valid_isovalues, 0);
+  const std::size_t num_cells =
+      static_cast<std::size_t>(num_rows) * static_cast<std::size_t>(cx);
   for (int base_x = 0; base_x < cx; base_x += 32) {
     const int x = base_x + lane;
-    const std::uint32_t cell_id =
-        row_id * static_cast<std::uint32_t>(cx) +
-        static_cast<std::uint32_t>(x);
-    const std::uint32_t count = x < cx ? counts[cell_id] : 0;
-    std::uint32_t inclusive = count;
+    const std::size_t cell_id =
+        static_cast<std::size_t>(row_id) * static_cast<std::size_t>(cx) +
+        static_cast<std::size_t>(x);
+    std::uint64_t packed_counts = 0;
 #pragma unroll
-    for (int delta = 1; delta < 32; delta <<= 1) {
-      const std::uint32_t preceding =
-          __shfl_up_sync(0xffffffffU, inclusive, delta);
-      if (lane >= delta) {
-        inclusive += preceding;
-      }
+    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+      const std::uint64_t count =
+          x < cx ? counts[static_cast<std::size_t>(iso) * num_cells + cell_id]
+                 : 0;
+      packed_counts |= count << (8 * iso);
     }
-    const std::uint32_t offset = row_prefix + inclusive - count;
 
-    if (count != 0 &&
-        static_cast<std::uint64_t>(offset) + count <= capacity) {
+    float v0 = 0.0f;
+    float v1 = 0.0f;
+    float v2 = 0.0f;
+    float v3 = 0.0f;
+    float v4 = 0.0f;
+    float v5 = 0.0f;
+    float v6 = 0.0f;
+    float v7 = 0.0f;
+    if (packed_counts != 0) {
       const std::size_t unx = static_cast<std::size_t>(nx);
       const std::size_t volume_row = unx;
       const std::size_t volume_plane =
@@ -274,119 +287,150 @@ __global__ void generate_triangles_by_row(
            static_cast<std::size_t>(y)) *
               unx +
           static_cast<std::size_t>(x);
-      const float v0 = volume[base];
-      const float v1 = volume[base + 1];
-      const float v2 = volume[base + volume_row + 1];
-      const float v3 = volume[base + volume_row];
-      const float v4 = volume[base + volume_plane];
-      const float v5 = volume[base + volume_plane + 1];
-      const float v6 = volume[base + volume_plane + volume_row + 1];
-      const float v7 = volume[base + volume_plane + volume_row];
-      const float isovalue = isovalues[iso];
-      const std::uint8_t cube_case = static_cast<std::uint8_t>(
-          (static_cast<unsigned int>(v0 < isovalue) << 0) |
-          (static_cast<unsigned int>(v1 < isovalue) << 1) |
-          (static_cast<unsigned int>(v2 < isovalue) << 2) |
-          (static_cast<unsigned int>(v3 < isovalue) << 3) |
-          (static_cast<unsigned int>(v4 < isovalue) << 4) |
-          (static_cast<unsigned int>(v5 < isovalue) << 5) |
-          (static_cast<unsigned int>(v6 < isovalue) << 6) |
-          (static_cast<unsigned int>(v7 < isovalue) << 7));
-      const std::int8_t* row = g_triangle_table[cube_case];
-      const float fx = static_cast<float>(x);
-      const float fy = static_cast<float>(y);
-      const float fz = static_cast<float>(z);
-      const auto interpolate_edge = [&](int edge, float& px, float& py,
-                                        float& pz) {
-        float t = 0.0f;
-        switch (edge) {
-          case 0:
-            t = (isovalue - v0) / (v1 - v0);
-            px = fx + t;
-            py = fy;
-            pz = fz;
-            break;
-          case 1:
-            t = (isovalue - v1) / (v2 - v1);
-            px = fx + 1.0f;
-            py = fy + t;
-            pz = fz;
-            break;
-          case 2:
-            t = (isovalue - v2) / (v3 - v2);
-            px = fx + 1.0f - t;
-            py = fy + 1.0f;
-            pz = fz;
-            break;
-          case 3:
-            t = (isovalue - v3) / (v0 - v3);
-            px = fx;
-            py = fy + 1.0f - t;
-            pz = fz;
-            break;
-          case 4:
-            t = (isovalue - v4) / (v5 - v4);
-            px = fx + t;
-            py = fy;
-            pz = fz + 1.0f;
-            break;
-          case 5:
-            t = (isovalue - v5) / (v6 - v5);
-            px = fx + 1.0f;
-            py = fy + t;
-            pz = fz + 1.0f;
-            break;
-          case 6:
-            t = (isovalue - v6) / (v7 - v6);
-            px = fx + 1.0f - t;
-            py = fy + 1.0f;
-            pz = fz + 1.0f;
-            break;
-          case 7:
-            t = (isovalue - v7) / (v4 - v7);
-            px = fx;
-            py = fy + 1.0f - t;
-            pz = fz + 1.0f;
-            break;
-          case 8:
-            t = (isovalue - v0) / (v4 - v0);
-            px = fx;
-            py = fy;
-            pz = fz + t;
-            break;
-          case 9:
-            t = (isovalue - v1) / (v5 - v1);
-            px = fx + 1.0f;
-            py = fy;
-            pz = fz + t;
-            break;
-          case 10:
-            t = (isovalue - v2) / (v6 - v2);
-            px = fx + 1.0f;
-            py = fy + 1.0f;
-            pz = fz + t;
-            break;
-          default:
-            t = (isovalue - v3) / (v7 - v3);
-            px = fx;
-            py = fy + 1.0f;
-            pz = fz + t;
-            break;
+      v0 = volume[base];
+      v1 = volume[base + 1];
+      v2 = volume[base + volume_row + 1];
+      v3 = volume[base + volume_row];
+      v4 = volume[base + volume_plane];
+      v5 = volume[base + volume_plane + 1];
+      v6 = volume[base + volume_plane + volume_row + 1];
+      v7 = volume[base + volume_plane + volume_row];
+    }
+
+#pragma unroll 1
+    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+      const std::uint32_t count =
+          static_cast<std::uint32_t>((packed_counts >> (8 * iso)) & 0xffU);
+      std::uint32_t inclusive = count;
+#pragma unroll
+      for (int delta = 1; delta < 32; delta <<= 1) {
+        const std::uint32_t preceding =
+            __shfl_up_sync(0xffffffffU, inclusive, delta);
+        if (lane >= delta) {
+          inclusive += preceding;
         }
-      };
-      for (std::uint32_t triangle = 0; triangle < count; ++triangle) {
-        icecarver::Triangle output_triangle;
-        const int first = 3 * static_cast<int>(triangle);
-        interpolate_edge(row[first], output_triangle.x0, output_triangle.y0,
-                         output_triangle.z0);
-        interpolate_edge(row[first + 1], output_triangle.x1,
-                         output_triangle.y1, output_triangle.z1);
-        interpolate_edge(row[first + 2], output_triangle.x2,
-                         output_triangle.y2, output_triangle.z2);
-        triangles[offset + triangle] = output_triangle;
+      }
+      std::uint32_t row_prefix = 0;
+      if (lane == 0) {
+        row_prefix = warp_prefixes[warp][iso];
+      }
+      row_prefix = __shfl_sync(0xffffffffU, row_prefix, 0);
+      const std::uint32_t offset = row_prefix + inclusive - count;
+
+      const std::uint64_t capacity = output.capacities[iso];
+      if (count != 0 && ((valid_isovalues >> iso) & 1U) != 0 &&
+          static_cast<std::uint64_t>(offset) + count <= capacity) {
+        icecarver::Triangle* __restrict__ triangles = output.triangles[iso];
+        const float isovalue = isovalues[iso];
+        const std::uint8_t cube_case = static_cast<std::uint8_t>(
+            (static_cast<unsigned int>(v0 < isovalue) << 0) |
+            (static_cast<unsigned int>(v1 < isovalue) << 1) |
+            (static_cast<unsigned int>(v2 < isovalue) << 2) |
+            (static_cast<unsigned int>(v3 < isovalue) << 3) |
+            (static_cast<unsigned int>(v4 < isovalue) << 4) |
+            (static_cast<unsigned int>(v5 < isovalue) << 5) |
+            (static_cast<unsigned int>(v6 < isovalue) << 6) |
+            (static_cast<unsigned int>(v7 < isovalue) << 7));
+        const std::int8_t* row = g_triangle_table[cube_case];
+        const float fx = static_cast<float>(x);
+        const float fy = static_cast<float>(y);
+        const float fz = static_cast<float>(z);
+        const auto interpolate_edge = [&](int edge, float& px, float& py,
+                                          float& pz) {
+          float t = 0.0f;
+          switch (edge) {
+            case 0:
+              t = (isovalue - v0) / (v1 - v0);
+              px = fx + t;
+              py = fy;
+              pz = fz;
+              break;
+            case 1:
+              t = (isovalue - v1) / (v2 - v1);
+              px = fx + 1.0f;
+              py = fy + t;
+              pz = fz;
+              break;
+            case 2:
+              t = (isovalue - v2) / (v3 - v2);
+              px = fx + 1.0f - t;
+              py = fy + 1.0f;
+              pz = fz;
+              break;
+            case 3:
+              t = (isovalue - v3) / (v0 - v3);
+              px = fx;
+              py = fy + 1.0f - t;
+              pz = fz;
+              break;
+            case 4:
+              t = (isovalue - v4) / (v5 - v4);
+              px = fx + t;
+              py = fy;
+              pz = fz + 1.0f;
+              break;
+            case 5:
+              t = (isovalue - v5) / (v6 - v5);
+              px = fx + 1.0f;
+              py = fy + t;
+              pz = fz + 1.0f;
+              break;
+            case 6:
+              t = (isovalue - v6) / (v7 - v6);
+              px = fx + 1.0f - t;
+              py = fy + 1.0f;
+              pz = fz + 1.0f;
+              break;
+            case 7:
+              t = (isovalue - v7) / (v4 - v7);
+              px = fx;
+              py = fy + 1.0f - t;
+              pz = fz + 1.0f;
+              break;
+            case 8:
+              t = (isovalue - v0) / (v4 - v0);
+              px = fx;
+              py = fy;
+              pz = fz + t;
+              break;
+            case 9:
+              t = (isovalue - v1) / (v5 - v1);
+              px = fx + 1.0f;
+              py = fy;
+              pz = fz + t;
+              break;
+            case 10:
+              t = (isovalue - v2) / (v6 - v2);
+              px = fx + 1.0f;
+              py = fy + 1.0f;
+              pz = fz + t;
+              break;
+            default:
+              t = (isovalue - v3) / (v7 - v3);
+              px = fx;
+              py = fy + 1.0f;
+              pz = fz + t;
+              break;
+          }
+        };
+        for (std::uint32_t triangle = 0; triangle < count; ++triangle) {
+          icecarver::Triangle output_triangle;
+          const int first = 3 * static_cast<int>(triangle);
+          interpolate_edge(row[first], output_triangle.x0,
+                           output_triangle.y0, output_triangle.z0);
+          interpolate_edge(row[first + 1], output_triangle.x1,
+                           output_triangle.y1, output_triangle.z1);
+          interpolate_edge(row[first + 2], output_triangle.x2,
+                           output_triangle.y2, output_triangle.z2);
+          triangles[offset + triangle] = output_triangle;
+        }
+      }
+      const std::uint32_t chunk_total =
+          __shfl_sync(0xffffffffU, inclusive, 31);
+      if (lane == 0) {
+        warp_prefixes[warp][iso] = row_prefix + chunk_total;
       }
     }
-    row_prefix += __shfl_sync(0xffffffffU, inclusive, 31);
   }
 }
 
@@ -430,10 +474,10 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   std::size_t offsets_bytes = 0;
   std::size_t offset_entries = static_cast<std::size_t>(num_cells);
   if (input->num_isovalues == icecarver::kMaxIsovalues &&
-      static_cast<std::size_t>(icecarver::kMaxIsovalues + 1) * rows >
+      static_cast<std::size_t>(2 * icecarver::kMaxIsovalues) * rows >
           offset_entries) {
     offset_entries =
-        static_cast<std::size_t>(icecarver::kMaxIsovalues + 1) * rows;
+        static_cast<std::size_t>(2 * icecarver::kMaxIsovalues) * rows;
   }
   if (!checked_multiply(static_cast<std::size_t>(num_cells),
                         static_cast<std::size_t>(input->num_isovalues),
@@ -526,24 +570,14 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
     if (input->num_isovalues == icecarver::kMaxIsovalues) {
       auto* row_counts = offsets + static_cast<std::size_t>(iso) * rows;
       auto* row_offsets =
-          offsets + static_cast<std::size_t>(icecarver::kMaxIsovalues) * rows;
+          offsets + static_cast<std::size_t>(icecarver::kMaxIsovalues + iso) *
+                        rows;
       ICECARVER_RETURN_IF_CUDA_ERROR(cub::DeviceScan::ExclusiveSum(
           scan_temp, scan_temp_bytes, row_counts, row_offsets,
           static_cast<int>(rows), stream));
       publish_row_total<<<1, 1, 0, stream>>>(
           row_counts, row_offsets, rows, output->triangle_counts, iso);
       ICECARVER_RETURN_IF_LAUNCH_ERROR();
-      if (input->emit_triangles != 0) {
-        const unsigned int row_blocks =
-            (rows + static_cast<unsigned int>(kEmitWarps) - 1U) /
-            static_cast<unsigned int>(kEmitWarps);
-        generate_triangles_by_row<<<row_blocks, kRowThreads, 0, stream>>>(
-            input->volume, input->nx, input->ny, input->nx - 1,
-            input->ny - 1, rows, input->isovalues, iso, iso_counts,
-            row_offsets, output->triangle_counts, output->triangles[iso],
-            output->capacities[iso]);
-        ICECARVER_RETURN_IF_LAUNCH_ERROR();
-      }
     } else {
       ICECARVER_RETURN_IF_CUDA_ERROR(cub::DeviceScan::ExclusiveSum(
           scan_temp, scan_temp_bytes, iso_counts, offsets,
@@ -560,6 +594,19 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
         ICECARVER_RETURN_IF_LAUNCH_ERROR();
       }
     }
+  }
+
+  if (input->num_isovalues == icecarver::kMaxIsovalues &&
+      input->emit_triangles != 0) {
+    const unsigned int row_blocks =
+        (rows + static_cast<unsigned int>(kEmitWarps) - 1U) /
+        static_cast<unsigned int>(kEmitWarps);
+    generate_triangles_by_row<<<row_blocks, kRowThreads, 0, stream>>>(
+        input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
+        rows, input->isovalues, counts,
+        offsets + static_cast<std::size_t>(icecarver::kMaxIsovalues) * rows,
+        *output);
+    ICECARVER_RETURN_IF_LAUNCH_ERROR();
   }
 
   if (input->emit_triangles != 0) {
