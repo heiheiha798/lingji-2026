@@ -125,9 +125,11 @@ __global__ void generate_triangles(
     std::uint32_t num_cells, const float* __restrict__ isovalues, int iso,
     const std::uint8_t* __restrict__ counts,
     const std::uint32_t* __restrict__ offsets,
+    const std::uint64_t* __restrict__ totals,
     icecarver::Triangle* __restrict__ triangles, std::uint64_t capacity) {
   const std::uint32_t cell_id = blockIdx.x * blockDim.x + threadIdx.x;
-  if (cell_id >= num_cells || counts[cell_id] == 0) {
+  if (totals[iso] > capacity || cell_id >= num_cells ||
+      counts[cell_id] == 0) {
     return;
   }
 
@@ -258,19 +260,26 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
     ICECARVER_RETURN_IF_LAUNCH_ERROR();
 
     if (input->emit_triangles != 0) {
-      std::uint64_t total = 0;
-      ICECARVER_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
-          &total, output->triangle_counts + iso, sizeof(total),
-          cudaMemcpyDeviceToHost, stream));
-      ICECARVER_RETURN_IF_CUDA_ERROR(cudaStreamSynchronize(stream));
-      if (total > output->capacities[iso]) {
-        return icecarver::kInsufficientOutput;
-      }
       generate_triangles<<<blocks, kThreads, 0, stream>>>(
           input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
           num_cells, input->isovalues, iso, iso_counts, offsets,
-          output->triangles[iso], output->capacities[iso]);
+          output->triangle_counts, output->triangles[iso],
+          output->capacities[iso]);
       ICECARVER_RETURN_IF_LAUNCH_ERROR();
+    }
+  }
+
+  if (input->emit_triangles != 0) {
+    std::uint64_t totals[icecarver::kMaxIsovalues]{};
+    ICECARVER_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
+        totals, output->triangle_counts,
+        static_cast<std::size_t>(input->num_isovalues) * sizeof(totals[0]),
+        cudaMemcpyDeviceToHost, stream));
+    ICECARVER_RETURN_IF_CUDA_ERROR(cudaStreamSynchronize(stream));
+    for (int iso = 0; iso < input->num_isovalues; ++iso) {
+      if (totals[iso] > output->capacities[iso]) {
+        return icecarver::kInsufficientOutput;
+      }
     }
   }
 
