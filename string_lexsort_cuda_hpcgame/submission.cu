@@ -12,7 +12,7 @@ namespace {
 constexpr int kThreads = 256;
 
 
-template <int kWidth>
+template <int kWidth, int kStart = 0>
 __device__ __forceinline__ bool index_less(
     int32_t lhs,
     int32_t rhs,
@@ -20,7 +20,7 @@ __device__ __forceinline__ bool index_less(
   const uint8_t* lhs_string = strings + static_cast<int64_t>(lhs) * kWidth;
   const uint8_t* rhs_string = strings + static_cast<int64_t>(rhs) * kWidth;
 #pragma unroll
-  for (int32_t offset = 0; offset < kWidth; offset += 4) {
+  for (int32_t offset = kStart; offset < kWidth; offset += 4) {
     const uint32_t lhs_word =
         *reinterpret_cast<const uint32_t*>(lhs_string + offset);
     const uint32_t rhs_word =
@@ -41,10 +41,18 @@ __global__ void sort_tiles(
     int32_t* __restrict__ indices,
     int32_t n) {
   __shared__ int32_t tile[kThreads];
+  __shared__ uint32_t prefixes[kThreads];
 
   const int32_t lane = static_cast<int32_t>(threadIdx.x);
   const int32_t index = static_cast<int32_t>(blockIdx.x * kThreads) + lane;
   tile[lane] = index < n ? index : INT32_MAX;
+  if (index < n) {
+    const uint32_t first_word = *reinterpret_cast<const uint32_t*>(
+        strings + static_cast<int64_t>(index) * kWidth);
+    prefixes[lane] = __byte_perm(first_word, 0, 0x0123);
+  } else {
+    prefixes[lane] = UINT32_MAX;
+  }
   __syncthreads();
 
   for (int32_t size = 2; size <= kThreads; size <<= 1) {
@@ -53,20 +61,30 @@ __global__ void sort_tiles(
       if (partner > lane) {
         const int32_t lhs = tile[lane];
         const int32_t rhs = tile[partner];
+        const uint32_t lhs_prefix = prefixes[lane];
+        const uint32_t rhs_prefix = prefixes[partner];
         const bool ascending = (lane & size) == 0;
         bool exchange;
         if (ascending) {
           exchange = lhs == INT32_MAX
               ? rhs != INT32_MAX
-              : rhs != INT32_MAX && index_less<kWidth>(rhs, lhs, strings);
+              : rhs != INT32_MAX &&
+                    (rhs_prefix < lhs_prefix ||
+                     (rhs_prefix == lhs_prefix &&
+                      index_less<kWidth, 4>(rhs, lhs, strings)));
         } else {
           exchange = rhs == INT32_MAX
               ? lhs != INT32_MAX
-              : lhs != INT32_MAX && index_less<kWidth>(lhs, rhs, strings);
+              : lhs != INT32_MAX &&
+                    (lhs_prefix < rhs_prefix ||
+                     (lhs_prefix == rhs_prefix &&
+                      index_less<kWidth, 4>(lhs, rhs, strings)));
         }
         if (exchange) {
           tile[lane] = rhs;
           tile[partner] = lhs;
+          prefixes[lane] = rhs_prefix;
+          prefixes[partner] = lhs_prefix;
         }
       }
       __syncthreads();
