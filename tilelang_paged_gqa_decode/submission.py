@@ -44,7 +44,7 @@ def _compile_paged_gqa_direct(
         ),
     ):
         with T.Kernel(
-            batch_size, num_kv_heads, threads=_THREADS
+            batch_size, num_kv_heads, threads=64
         ) as (batch, kv_head):
             q_shared = T.alloc_shared((_BLOCK_H, _HEAD_DIM), T.bfloat16)
             k_shared = T.alloc_shared((page_size, _HEAD_DIM), T.bfloat16)
