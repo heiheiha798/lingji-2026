@@ -69,15 +69,13 @@ __device__ __forceinline__ bool shared_global_suffix_less(
     int32_t lhs,
     int32_t rhs,
     int32_t block_begin,
-    const uint32_t* __restrict__ suffixes) {
+    const uint64_t* __restrict__ suffixes) {
   const int32_t lhs_position = lhs - block_begin;
   const int32_t rhs_position = rhs - block_begin;
 #pragma unroll
-  for (int32_t word = 1; word < kWidth / 4; ++word) {
-    const uint32_t lhs_word =
-        suffixes[(word - 1) * kThreads + lhs_position];
-    const uint32_t rhs_word =
-        suffixes[(word - 1) * kThreads + rhs_position];
+  for (int32_t word = 0; word < kWidth / 8; ++word) {
+    const uint64_t lhs_word = suffixes[word * kThreads + lhs_position];
+    const uint64_t rhs_word = suffixes[word * kThreads + rhs_position];
     if (lhs_word != rhs_word) {
       return lhs_word < rhs_word;
     }
@@ -93,24 +91,43 @@ __global__ void sort_tiles(
     int32_t n) {
   __shared__ int32_t tile[kThreads];
   __shared__ uint32_t prefixes[kThreads];
-  extern __shared__ uint32_t suffixes[];
+  extern __shared__ uint64_t suffixes[];
 
   const int32_t lane = static_cast<int32_t>(threadIdx.x);
   const int32_t block_begin = static_cast<int32_t>(blockIdx.x * kThreads);
   const int32_t index = block_begin + lane;
   tile[lane] = index < n ? index : INT32_MAX;
   if (index < n) {
-    const uint32_t first_word = *reinterpret_cast<const uint32_t*>(
-        strings + static_cast<int64_t>(index) * kWidth);
-    prefixes[lane] = __byte_perm(first_word, 0, 0x0123);
     if constexpr (kCacheSuffix) {
-#pragma unroll
-      for (int32_t word = 1; word < kWidth / 4; ++word) {
-        const uint32_t key_word = *reinterpret_cast<const uint32_t*>(
-            strings + static_cast<int64_t>(index) * kWidth + word * 4);
-        suffixes[(word - 1) * kThreads + lane] =
-            __byte_perm(key_word, 0, 0x0123);
-      }
+      static_assert(kWidth == 32);
+      const uint8_t* string =
+          strings + static_cast<int64_t>(index) * kWidth;
+      const uint4 first_half =
+          *reinterpret_cast<const uint4*>(string);
+      const uint4 second_half =
+          *reinterpret_cast<const uint4*>(string + sizeof(uint4));
+      const uint32_t first_prefix =
+          __byte_perm(first_half.x, 0, 0x0123);
+      prefixes[lane] = first_prefix;
+      suffixes[0 * kThreads + lane] =
+          (static_cast<uint64_t>(first_prefix) << 32) |
+          __byte_perm(first_half.y, 0, 0x0123);
+      suffixes[1 * kThreads + lane] =
+          (static_cast<uint64_t>(__byte_perm(first_half.z, 0, 0x0123))
+           << 32) |
+          __byte_perm(first_half.w, 0, 0x0123);
+      suffixes[2 * kThreads + lane] =
+          (static_cast<uint64_t>(__byte_perm(second_half.x, 0, 0x0123))
+           << 32) |
+          __byte_perm(second_half.y, 0, 0x0123);
+      suffixes[3 * kThreads + lane] =
+          (static_cast<uint64_t>(__byte_perm(second_half.z, 0, 0x0123))
+           << 32) |
+          __byte_perm(second_half.w, 0, 0x0123);
+    } else {
+      const uint32_t first_word = *reinterpret_cast<const uint32_t*>(
+          strings + static_cast<int64_t>(index) * kWidth);
+      prefixes[lane] = __byte_perm(first_word, 0, 0x0123);
     }
   } else {
     prefixes[lane] = UINT32_MAX;
@@ -393,7 +410,7 @@ void lexsort_cuda(
       sort_tiles<32, true><<<
           blocks,
           kThreads,
-          (32 / 4 - 1) * kThreads * sizeof(uint32_t),
+          (32 / 8) * kThreads * sizeof(uint64_t),
           capture_stream>>>(
           input_strings, output, n);
     } else {
