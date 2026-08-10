@@ -186,7 +186,7 @@ class Submission:
             )
             dummy_output = torch.empty_like(dummy_vg)
             self._fused_recurrent_kda_kernel[
-                (4 * case.batch * config.heads,)
+                ((8 if case.batch == 1 else 4) * case.batch * config.heads,)
             ](
                 q=dummy_qkg,
                 k=dummy_qkg,
@@ -210,7 +210,7 @@ class Submission:
                 K=config.key_dim,
                 V=config.value_dim,
                 BK=config.key_dim,
-                BV=32,
+                BV=16 if case.batch == 1 else 32,
                 stride_init_state_token=decode_state_pool.stride(1),
                 stride_final_state_token=decode_state_pool.stride(1),
                 stride_indices_seq=1,
@@ -300,7 +300,11 @@ class Submission:
         if plan.max_length < 64:
             state = private_state.canonical_state
             self._fused_recurrent_kda_kernel[
-                (4 * context.case.batch * context.config.heads,)
+                (
+                    (8 if context.case.batch == 1 else 4)
+                    * context.case.batch
+                    * context.config.heads,
+                )
             ](
                 q=args.q_act,
                 k=args.k_act,
@@ -324,7 +328,7 @@ class Submission:
                 K=context.config.key_dim,
                 V=context.config.value_dim,
                 BK=context.config.key_dim,
-                BV=32,
+                BV=16 if context.case.batch == 1 else 32,
                 stride_init_state_token=state.stride(0),
                 stride_final_state_token=state.stride(0),
                 stride_indices_seq=1,
@@ -440,7 +444,7 @@ class Submission:
         rows = output.numel() // context.config.value_dim
         with torch.cuda.graph(graph):
             self._fused_recurrent_kda_kernel[
-                (4 * batch * context.config.heads,)
+                ((8 if batch == 1 else 4) * batch * context.config.heads,)
             ](
                 q=token.q_act,
                 k=token.k_act,
@@ -464,7 +468,7 @@ class Submission:
                 K=context.config.key_dim,
                 V=context.config.value_dim,
                 BK=context.config.key_dim,
-                BV=32,
+                BV=16 if batch == 1 else 32,
                 stride_init_state_token=context.decode_state_pool.stride(1),
                 stride_final_state_token=context.decode_state_pool.stride(1),
                 stride_indices_seq=1,
