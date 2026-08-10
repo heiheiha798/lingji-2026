@@ -8,12 +8,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 
 namespace {
 
 constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr int kThreads = 256;
-constexpr std::uint32_t kImplementationId = 3;
+constexpr std::uint32_t kImplementationId = 4;
 
 __device__ __constant__ std::int8_t g_triangle_table[256][16];
 __device__ __constant__ std::uint8_t g_triangle_count[256];
@@ -212,6 +213,22 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   auto* offsets = reinterpret_cast<std::uint32_t*>(bytes + offsets_offset);
   void* scan_temp = bytes + scan_temp_offset;
 
+  static std::once_flag table_init_once;
+  static cudaError_t table_init_status = cudaSuccess;
+  std::call_once(table_init_once, [] {
+    table_init_status = cudaMemcpyToSymbol(
+        g_triangle_table, icecarver::mc::kTriangleTable,
+        sizeof(icecarver::mc::kTriangleTable));
+    if (table_init_status == cudaSuccess) {
+      table_init_status = cudaMemcpyToSymbol(
+          g_triangle_count, icecarver::mc::kTriangleCount,
+          sizeof(icecarver::mc::kTriangleCount));
+    }
+  });
+  if (table_init_status != cudaSuccess) {
+    return icecarver::kCudaFailure;
+  }
+
   const icecarver::WorkspaceDescriptor descriptor{
       icecarver::kWorkspaceMagic,
       icecarver::kWorkspaceVersion,
@@ -227,14 +244,6 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
       static_cast<icecarver::WorkspaceDescriptor*>(workspace), descriptor);
   ICECARVER_RETURN_IF_LAUNCH_ERROR();
 
-  ICECARVER_RETURN_IF_CUDA_ERROR(cudaMemcpyToSymbolAsync(
-      g_triangle_table, icecarver::mc::kTriangleTable,
-      sizeof(icecarver::mc::kTriangleTable), 0, cudaMemcpyHostToDevice,
-      stream));
-  ICECARVER_RETURN_IF_CUDA_ERROR(cudaMemcpyToSymbolAsync(
-      g_triangle_count, icecarver::mc::kTriangleCount,
-      sizeof(icecarver::mc::kTriangleCount), 0, cudaMemcpyHostToDevice,
-      stream));
   ICECARVER_RETURN_IF_CUDA_ERROR(cudaMemsetAsync(
       output->triangle_counts, 0,
       static_cast<std::size_t>(input->num_isovalues) * sizeof(std::uint64_t),

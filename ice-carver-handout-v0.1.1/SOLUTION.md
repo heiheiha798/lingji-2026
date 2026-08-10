@@ -20,7 +20,8 @@
 workspace 保存全部 iso 的 uint8 计数、一个 iso 的 uint32 offsets 和 CUB scan
 临时区。各 iso 的 scan、total 发布和 emit 在传入 stream 上顺序执行；emit 直接
 读取 device total 做容量保护。所有 iso 完成后只进行一次 totals D2H 和 stream
-同步，取代每个 iso 一次同步。
+同步，取代每个 iso 一次同步。只读 marching-cubes 查表通过线程安全的一次性
+初始化装入 constant memory，后续 solve 不再重复传输 4.25 KiB 静态数据。
 
 ## 4. 正确性处理
 
@@ -32,10 +33,10 @@ kernel 不写输出；最终同步后返回 `kInsufficientOutput`，不会越界
 
 |测试点|是否正确|中位时间 / ms|相对 public baseline 加速|
 |---|---:|---:|---:|
-|P4|是|1.10462|1.005x|
-|P5|是|2.10775|1.059x|
-|P6|是|2.79407|1.003x|
-|P7|是|10.8842|0.997x|
+|P4|是|1.09878|1.010x|
+|P5|是|2.11263|1.056x|
+|P6|是|2.78416|1.006x|
+|P7|是|10.8515|1.000x|
 
 ## 6. 复现命令
 
