@@ -19,12 +19,27 @@ autograd：评测会对 o 做 backward，梯度须回传到 q/k/v/beta。只优�
 但**不得跨独立 trial 缓存依赖输入值的输出**——评测逐轮刷新输入并复验，缓存/快照会被判正确性失败。
 """
 
+from fla.modules.l2norm import l2norm_fwd
+from fla.ops.gated_delta_rule.chunk import (
+    ChunkGatedDeltaRuleFunction,
+    chunk_gated_delta_rule_fwd,
+)
+
 
 def gdn_chunk_scan(q, k, v, g, beta, scale):
-    from fla.ops.gated_delta_rule.chunk import ChunkGatedDeltaRuleFunction
-    o, _ = ChunkGatedDeltaRuleFunction.apply(
-        q, k, v, g, beta, scale,
-        None, False, True, None, None, True,
-        False, None, None, False, False, None,
-    )
-    return o
+    if q.requires_grad or k.requires_grad or v.requires_grad or beta.requires_grad:
+        o, _ = ChunkGatedDeltaRuleFunction.apply(
+            q, k, v, g, beta, scale,
+            None, False, True, None, None, True,
+            False, None, None, False, False, None,
+        )
+        return o
+
+    q_norm, _ = l2norm_fwd(q)
+    k_norm, _ = l2norm_fwd(k)
+    o = chunk_gated_delta_rule_fwd(
+        q=q_norm, k=k_norm, v=v, g=g, beta=beta,
+        scale=scale, initial_state=None, output_final_state=False,
+        state_v_first=True,
+    )[1]
+    return o.to(q.dtype)
