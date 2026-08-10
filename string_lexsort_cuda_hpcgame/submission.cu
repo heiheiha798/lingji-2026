@@ -65,20 +65,53 @@ __device__ __forceinline__ bool shared_index_less(
 
 
 template <int kWidth>
+__device__ __forceinline__ bool shared_global_suffix_less(
+    int32_t lhs,
+    int32_t rhs,
+    int32_t block_begin,
+    const uint32_t* __restrict__ suffixes) {
+  const int32_t lhs_position = lhs - block_begin;
+  const int32_t rhs_position = rhs - block_begin;
+#pragma unroll
+  for (int32_t word = 1; word < kWidth / 4; ++word) {
+    const uint32_t lhs_word =
+        suffixes[(word - 1) * kThreads + lhs_position];
+    const uint32_t rhs_word =
+        suffixes[(word - 1) * kThreads + rhs_position];
+    if (lhs_word != rhs_word) {
+      return lhs_word < rhs_word;
+    }
+  }
+  return lhs < rhs;
+}
+
+
+template <int kWidth, bool kCacheSuffix = false>
 __global__ void sort_tiles(
     const uint8_t* __restrict__ strings,
     int32_t* __restrict__ indices,
     int32_t n) {
   __shared__ int32_t tile[kThreads];
   __shared__ uint32_t prefixes[kThreads];
+  extern __shared__ uint32_t suffixes[];
 
   const int32_t lane = static_cast<int32_t>(threadIdx.x);
-  const int32_t index = static_cast<int32_t>(blockIdx.x * kThreads) + lane;
+  const int32_t block_begin = static_cast<int32_t>(blockIdx.x * kThreads);
+  const int32_t index = block_begin + lane;
   tile[lane] = index < n ? index : INT32_MAX;
   if (index < n) {
     const uint32_t first_word = *reinterpret_cast<const uint32_t*>(
         strings + static_cast<int64_t>(index) * kWidth);
     prefixes[lane] = __byte_perm(first_word, 0, 0x0123);
+    if constexpr (kCacheSuffix) {
+#pragma unroll
+      for (int32_t word = 1; word < kWidth / 4; ++word) {
+        const uint32_t key_word = *reinterpret_cast<const uint32_t*>(
+            strings + static_cast<int64_t>(index) * kWidth + word * 4);
+        suffixes[(word - 1) * kThreads + lane] =
+            __byte_perm(key_word, 0, 0x0123);
+      }
+    }
   } else {
     prefixes[lane] = UINT32_MAX;
   }
@@ -100,14 +133,22 @@ __global__ void sort_tiles(
               : rhs != INT32_MAX &&
                     (rhs_prefix < lhs_prefix ||
                      (rhs_prefix == lhs_prefix &&
-                      index_less<kWidth, 4>(rhs, lhs, strings)));
+                      (kCacheSuffix
+                           ? shared_global_suffix_less<kWidth>(
+                                 rhs, lhs, block_begin, suffixes)
+                           : index_less<kWidth, 4>(
+                                 rhs, lhs, strings))));
         } else {
           exchange = rhs == INT32_MAX
               ? lhs != INT32_MAX
               : lhs != INT32_MAX &&
                     (lhs_prefix < rhs_prefix ||
                      (lhs_prefix == rhs_prefix &&
-                      index_less<kWidth, 4>(lhs, rhs, strings)));
+                      (kCacheSuffix
+                           ? shared_global_suffix_less<kWidth>(
+                                 lhs, rhs, block_begin, suffixes)
+                           : index_less<kWidth, 4>(
+                                 lhs, rhs, strings))));
         }
         if (exchange) {
           tile[lane] = rhs;
@@ -332,7 +373,11 @@ void lexsort_cuda(
     sort_tiles<16><<<blocks, kThreads, 0, capture_stream>>>(
         input_strings, output, n);
   } else if (width == 32) {
-    sort_tiles<32><<<blocks, kThreads, 0, capture_stream>>>(
+    sort_tiles<32, true><<<
+        blocks,
+        kThreads,
+        (32 / 4 - 1) * kThreads * sizeof(uint32_t),
+        capture_stream>>>(
         input_strings, output, n);
   } else {
     TORCH_CHECK(width == 64, "unsupported string width: ", width);
