@@ -13,6 +13,10 @@ namespace {
 
 constexpr int kDagBatchNeighborCapacity = 256;
 constexpr int kDagCpuValidationRows = 1024;
+constexpr int kOrderedBlockSize = 64;
+constexpr int kOrderedBlockMaximumDegree = 8;
+constexpr int kOrderedBlockNeighborCapacity =
+    kOrderedBlockSize * kOrderedBlockMaximumDegree;
 
 __global__ void AnalyzeDagCandidate(std::uint64_t *reach,
                                     std::uint64_t *descriptors, int vertices,
@@ -20,6 +24,7 @@ __global__ void AnalyzeDagCandidate(std::uint64_t *reach,
   __shared__ int warp_degrees[8];
   __shared__ int warp_minimum_targets[8];
   __shared__ int warp_invalid[8];
+  __shared__ int warp_block_invalid[8];
   const int row = blockIdx.x;
   const int diagonal_word = row / 64;
   const int diagonal_bit = row & 63;
@@ -27,11 +32,13 @@ __global__ void AnalyzeDagCandidate(std::uint64_t *reach,
   int degree = 0;
   int minimum_target = vertices;
   int invalid = 0;
+  int block_invalid = 0;
   for (int word = threadIdx.x; word < words; word += blockDim.x) {
     const std::uint64_t value = reach[base + word];
     std::uint64_t remaining = value;
     if (word < diagonal_word) {
       invalid |= value != 0;
+      block_invalid |= value != 0;
       remaining = 0;
     } else if (word == diagonal_word) {
       if (diagonal_bit != 0)
@@ -52,6 +59,8 @@ __global__ void AnalyzeDagCandidate(std::uint64_t *reach,
   for (int offset = 16; offset > 0; offset /= 2) {
     degree += __shfl_down_sync(0xffffffffU, degree, offset);
     invalid |= __shfl_down_sync(0xffffffffU, invalid, offset);
+    block_invalid |=
+        __shfl_down_sync(0xffffffffU, block_invalid, offset);
     minimum_target =
         min(minimum_target,
             __shfl_down_sync(0xffffffffU, minimum_target, offset));
@@ -62,6 +71,7 @@ __global__ void AnalyzeDagCandidate(std::uint64_t *reach,
     warp_degrees[warp] = degree;
     warp_minimum_targets[warp] = minimum_target;
     warp_invalid[warp] = invalid;
+    warp_block_invalid[warp] = block_invalid;
   }
   __syncthreads();
   if (warp == 0) {
@@ -69,9 +79,12 @@ __global__ void AnalyzeDagCandidate(std::uint64_t *reach,
     minimum_target =
         lane < 8 ? warp_minimum_targets[lane] : vertices;
     invalid = lane < 8 ? warp_invalid[lane] : 0;
+    block_invalid = lane < 8 ? warp_block_invalid[lane] : 0;
     for (int offset = 16; offset > 0; offset /= 2) {
       degree += __shfl_down_sync(0xffffffffU, degree, offset);
       invalid |= __shfl_down_sync(0xffffffffU, invalid, offset);
+      block_invalid |=
+          __shfl_down_sync(0xffffffffU, block_invalid, offset);
       minimum_target =
           min(minimum_target,
               __shfl_down_sync(0xffffffffU, minimum_target, offset));
@@ -82,12 +95,127 @@ __global__ void AnalyzeDagCandidate(std::uint64_t *reach,
                static_cast<std::uint32_t>(degree) |
                (invalid != 0 ? 0x80000000U : 0U))
            << 32) |
-          static_cast<std::uint32_t>(minimum_target);
+          (static_cast<std::uint32_t>(minimum_target) |
+           (block_invalid != 0 ? 0x80000000U : 0U));
       reach[base + diagonal_word] |= 1ULL << diagonal_bit;
       if ((vertices & 63) != 0)
         reach[base + words - 1] &= (1ULL << (vertices & 63)) - 1ULL;
     }
   }
+}
+
+__global__ void CloseOrderedDiagonalBlocks(std::uint64_t *reach,
+                                           int *representatives,
+                                           int vertices, int words) {
+  __shared__ std::uint64_t current_pivot;
+  __shared__ std::uint64_t closed_masks[kOrderedBlockSize];
+  const int block_start = blockIdx.x * kOrderedBlockSize;
+  const int block_size =
+      min(kOrderedBlockSize, vertices - block_start);
+  const int row = threadIdx.x;
+  std::uint64_t row_mask = 0;
+  if (row < block_size) {
+    row_mask = reach[static_cast<std::size_t>(block_start + row) * words +
+                     blockIdx.x];
+    if (block_size < kOrderedBlockSize)
+      row_mask &= (1ULL << block_size) - 1ULL;
+    row_mask |= 1ULL << row;
+  }
+  for (int pivot = 0; pivot < block_size; ++pivot) {
+    if (row == pivot) current_pivot = row_mask;
+    __syncthreads();
+    if (row < block_size && (row_mask & (1ULL << pivot)) != 0)
+      row_mask |= current_pivot;
+    __syncthreads();
+  }
+  closed_masks[row] = row_mask;
+  __syncthreads();
+  if (row < block_size) {
+    int representative = row;
+    for (int candidate = 0; candidate < row; ++candidate) {
+      if (closed_masks[candidate] == row_mask) {
+        representative = candidate;
+        break;
+      }
+    }
+    const int global_row = block_start + row;
+    representatives[global_row] = block_start + representative;
+    reach[static_cast<std::size_t>(global_row) * words + blockIdx.x] =
+        row_mask;
+  }
+}
+
+__global__ void BuildOrderedBlockRows(const std::uint64_t *reach,
+                                      std::uint64_t *block_rows,
+                                      const int *representatives, int words,
+                                      int block_start, int block_size) {
+  const int row_offset = blockIdx.x;
+  if (row_offset >= block_size) return;
+  const int row = block_start + row_offset;
+  if (representatives[row] != row) return;
+  const int word = blockIdx.y * blockDim.x + threadIdx.x;
+  if (word >= words) return;
+  std::uint64_t remaining =
+      reach[static_cast<std::size_t>(row) * words + block_start / 64];
+  std::uint64_t output = 0;
+  while (remaining != 0) {
+    const int source = __ffsll(static_cast<long long>(remaining)) - 1;
+    output |= reach[static_cast<std::size_t>(block_start + source) * words +
+                    word];
+    remaining &= remaining - 1;
+  }
+  block_rows[static_cast<std::size_t>(row_offset) * words + word] = output;
+}
+
+__global__ void CloseOrderedBlockRows(std::uint64_t *reach,
+                                      const std::uint64_t *block_rows,
+                                      const int *representatives, int words,
+                                      int block_start, int block_size) {
+  __shared__ int neighbor_count;
+  __shared__ int neighbors[kOrderedBlockNeighborCapacity];
+  const int row_offset = blockIdx.x;
+  if (row_offset >= block_size) return;
+  const int row = block_start + row_offset;
+  if (representatives[row] != row) return;
+  if (threadIdx.x == 0) neighbor_count = 0;
+  __syncthreads();
+  const std::size_t scratch_base =
+      static_cast<std::size_t>(row_offset) * words;
+  for (int word = block_start / 64 + 1 + threadIdx.x; word < words;
+       word += blockDim.x) {
+    std::uint64_t remaining = block_rows[scratch_base + word];
+    while (remaining != 0) {
+      const int bit = __ffsll(static_cast<long long>(remaining)) - 1;
+      const int position = atomicAdd(&neighbor_count, 1);
+      neighbors[position] = word * 64 + bit;
+      remaining &= remaining - 1;
+    }
+  }
+  __syncthreads();
+  const std::size_t output_base = static_cast<std::size_t>(row) * words;
+  const int count = neighbor_count;
+  for (int word = threadIdx.x; word < words; word += blockDim.x) {
+    std::uint64_t output = block_rows[scratch_base + word];
+    for (int index = 0; index < count; ++index) {
+      output |= reach[static_cast<std::size_t>(neighbors[index]) * words +
+                      word];
+    }
+    reach[output_base + word] = output;
+  }
+}
+
+__global__ void CopyOrderedBlockRows(std::uint64_t *reach,
+                                     const int *representatives, int words,
+                                     int block_start, int block_size) {
+  const int row_offset = blockIdx.x;
+  if (row_offset >= block_size) return;
+  const int row = block_start + row_offset;
+  const int representative = representatives[row];
+  if (representative == row) return;
+  const int word = blockIdx.y * blockDim.x + threadIdx.x;
+  if (word >= words) return;
+  reach[static_cast<std::size_t>(row) * words + word] =
+      reach[static_cast<std::size_t>(representative) * words + word];
 }
 
 __global__ void CloseUpperTriangularDag(std::uint64_t *reach,
@@ -245,14 +373,17 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
     }
   }
   bool use_dag_closure = adjacent_successors < vertices / 2;
+  bool ordered_block_candidate = true;
   for (int row = 1;
-       row < vertices && row < kDagCpuValidationRows && use_dag_closure;
+       row < vertices && row < kDagCpuValidationRows &&
+       (use_dag_closure || ordered_block_candidate);
        ++row) {
     const std::size_t base = static_cast<std::size_t>(row) * words_per_row;
     const int diagonal_word = row / 64;
     for (int word = 0; word < diagonal_word; ++word) {
       if (adjacency[base + word] != 0) {
         use_dag_closure = false;
+        ordered_block_candidate = false;
         break;
       }
     }
@@ -266,6 +397,7 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   std::vector<int> dag_batch_starts;
   bool use_parallel_dag_batches = false;
   bool use_cooperative_dag_batches = false;
+  bool use_ordered_block_closure = false;
   int maximum_dag_batch_size = 0;
   constexpr int kPivotBlock = 256;
   const std::size_t pivot_bytes = static_cast<std::size_t>(kPivotBlock) *
@@ -312,7 +444,9 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
                               cudaMemcpyHostToDevice, d.stream))) {
     return 2;
   }
-  if (use_dag_closure) {
+  const bool analyze_ordered_structure =
+      use_dag_closure || ordered_block_candidate;
+  if (analyze_ordered_structure) {
     std::vector<std::uint64_t> dag_descriptors(vertices);
     AnalyzeDagCandidate<<<vertices, 256, 0, d.stream>>>(
         d.reachability, d.pivot_rows, vertices, words_per_row);
@@ -328,21 +462,24 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
     for (const std::uint64_t descriptor : dag_descriptors) {
       const std::uint32_t summary =
           static_cast<std::uint32_t>(descriptor >> 32);
-      if ((summary & 0x80000000U) != 0) {
-        use_dag_closure = false;
-        break;
-      }
-      const int degree = static_cast<int>(summary);
+      if ((summary & 0x80000000U) != 0) use_dag_closure = false;
+      if ((static_cast<std::uint32_t>(descriptor) & 0x80000000U) != 0)
+        ordered_block_candidate = false;
+      const int degree = static_cast<int>(summary & 0x7fffffffU);
       if (degree > maximum_degree) maximum_degree = degree;
     }
+    use_ordered_block_closure =
+        ordered_block_candidate &&
+        maximum_degree <= kOrderedBlockMaximumDegree;
     if (use_dag_closure &&
         maximum_degree <= kDagBatchNeighborCapacity) {
       int batch_end = vertices;
       while (batch_end > 0) {
         int batch_start = batch_end - 1;
         while (batch_start > 0 &&
-               static_cast<std::uint32_t>(
-                   dag_descriptors[batch_start - 1]) >= batch_end) {
+               (static_cast<std::uint32_t>(
+                    dag_descriptors[batch_start - 1]) &
+                0x7fffffffU) >= static_cast<std::uint32_t>(batch_end)) {
           --batch_start;
         }
         const int batch_size = batch_end - batch_start;
@@ -416,6 +553,35 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
       CloseUpperTriangularDag<<<1, 256, 0, d.stream>>>(
           d.reachability, reinterpret_cast<int *>(d.pivot_rows), vertices,
           words_per_row);
+    }
+  } else if (use_ordered_block_closure) {
+    int *representatives = reinterpret_cast<int *>(d.pivot_rows);
+    const std::size_t representative_words =
+        (static_cast<std::size_t>(vertices) * sizeof(int) +
+         sizeof(std::uint64_t) - 1) /
+        sizeof(std::uint64_t);
+    std::uint64_t *block_rows = d.pivot_rows + representative_words;
+    CloseOrderedDiagonalBlocks<<<
+        (vertices + kOrderedBlockSize - 1) / kOrderedBlockSize,
+        kOrderedBlockSize, 0, d.stream>>>(
+        d.reachability, representatives, vertices, words_per_row);
+    for (int block_start =
+             ((vertices - 1) / kOrderedBlockSize) * kOrderedBlockSize;
+         block_start >= 0; block_start -= kOrderedBlockSize) {
+      const int remaining = vertices - block_start;
+      const int block_size =
+          remaining < kOrderedBlockSize ? remaining : kOrderedBlockSize;
+      BuildOrderedBlockRows<<<
+          dim3(block_size, (words_per_row + 127) / 128), 128, 0,
+          d.stream>>>(d.reachability, block_rows, representatives,
+                      words_per_row, block_start, block_size);
+      CloseOrderedBlockRows<<<block_size, 256, 0, d.stream>>>(
+          d.reachability, block_rows, representatives, words_per_row,
+          block_start, block_size);
+      CopyOrderedBlockRows<<<
+          dim3(block_size, (words_per_row + 255) / 256), 256, 0,
+          d.stream>>>(d.reachability, representatives, words_per_row,
+                      block_start, block_size);
     }
   } else {
     const int pivot_stride = words_per_row <= 512 ? kPivotBlock : 128;
