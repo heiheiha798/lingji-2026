@@ -18,7 +18,6 @@ struct DeviceResources {
   cudaStream_t stream = nullptr;
 
   ~DeviceResources() {
-    cudaFree(active);
     cudaFree(height_b);
     cudaFree(height_a);
     cudaFree(odometer);
@@ -56,15 +55,16 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
   const std::size_t height_bytes = n * static_cast<std::size_t>(height_width);
   DeviceResources d;
   if (!CudaOk(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking)) ||
-      !CudaOk(cudaMalloc(&d.initial, n * sizeof(std::uint32_t))) ||
+      !CudaOk(cudaMalloc(&d.initial, n * sizeof(std::uint32_t) +
+                                         5 * sizeof(int))) ||
       !CudaOk(cudaMalloc(&d.odometer, n * sizeof(std::uint64_t))) ||
       !CudaOk(cudaMalloc(&d.height_a, height_bytes)) ||
       !CudaOk(cudaMalloc(&d.height_b, height_bytes)) ||
-      !CudaOk(cudaMalloc(&d.active, 5 * sizeof(int))) ||
       !CudaOk(cudaMemcpyAsync(d.initial, initial, n * sizeof(std::uint32_t),
                               cudaMemcpyHostToDevice, d.stream))) {
     return 2;
   }
+  d.active = reinterpret_cast<int *>(d.initial + n);
 
   auto *a = d.height_a;
   auto *b = d.height_b;
