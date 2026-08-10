@@ -97,7 +97,7 @@ __global__ void sort_tiles(
 }
 
 
-template <int kWidth>
+template <int kWidth, bool kCachePrefix = false>
 __global__ void merge_pass(
     const uint8_t* __restrict__ strings,
     const int32_t* __restrict__ source,
@@ -105,6 +105,7 @@ __global__ void merge_pass(
     int32_t n,
     int32_t run_length) {
   __shared__ int32_t tile[kThreads];
+  __shared__ uint32_t tile_prefixes[kCachePrefix ? kThreads : 1];
   __shared__ int32_t block_partitions[2];
 
   const int32_t lane = static_cast<int32_t>(threadIdx.x);
@@ -142,10 +143,16 @@ __global__ void merge_pass(
   const int32_t left_count = block_partitions[1] - left_begin;
   const int32_t right_offset = block_diagonal - left_begin;
   const int32_t right_count = output_count - left_count;
-  if (lane < left_count) {
-    tile[lane] = source[pair_begin + left_begin + lane];
-  } else if (lane < output_count) {
-    tile[lane] = source[right_begin + right_offset + lane - left_count];
+  if (lane < output_count) {
+    const int32_t index = lane < left_count
+        ? source[pair_begin + left_begin + lane]
+        : source[right_begin + right_offset + lane - left_count];
+    tile[lane] = index;
+    if constexpr (kCachePrefix) {
+      const uint32_t first_word = *reinterpret_cast<const uint32_t*>(
+          strings + static_cast<int64_t>(index) * kWidth);
+      tile_prefixes[lane] = __byte_perm(first_word, 0, 0x0123);
+    }
   }
   __syncthreads();
 
@@ -158,12 +165,28 @@ __global__ void merge_pass(
   while (low < high) {
     const int32_t left = (low + high) >> 1;
     const int32_t right = lane - left;
-    if (left < left_count && right > 0 &&
-        index_less<kWidth>(
-            tile[left],
-            tile[left_count + right - 1],
-            strings)) {
-      low = left + 1;
+    if (left < left_count && right > 0) {
+      bool left_before_right;
+      if constexpr (kCachePrefix) {
+        const uint32_t left_prefix = tile_prefixes[left];
+        const uint32_t right_prefix = tile_prefixes[left_count + right - 1];
+        left_before_right = left_prefix < right_prefix ||
+            (left_prefix == right_prefix &&
+             index_less<kWidth, 4>(
+                 tile[left],
+                 tile[left_count + right - 1],
+                 strings));
+      } else {
+        left_before_right = index_less<kWidth>(
+               tile[left],
+               tile[left_count + right - 1],
+               strings);
+      }
+      if (left_before_right) {
+        low = left + 1;
+      } else {
+        high = left;
+      }
     } else {
       high = left;
     }
@@ -171,12 +194,21 @@ __global__ void merge_pass(
 
   const int32_t left = low;
   const int32_t right = lane - left;
-  if (left < left_count &&
-      (right >= right_count ||
-       index_less<kWidth>(
-           tile[left],
-           tile[left_count + right],
-           strings))) {
+  bool take_left = left < left_count && right >= right_count;
+  if (left < left_count && right < right_count) {
+    if constexpr (kCachePrefix) {
+      const uint32_t left_prefix = tile_prefixes[left];
+      const uint32_t right_prefix = tile_prefixes[left_count + right];
+      take_left = left_prefix < right_prefix ||
+          (left_prefix == right_prefix &&
+           index_less<kWidth, 4>(
+               tile[left], tile[left_count + right], strings));
+    } else {
+      take_left = index_less<kWidth>(
+          tile[left], tile[left_count + right], strings);
+    }
+  }
+  if (take_left) {
     destination[block_begin + lane] = tile[left];
   } else {
     destination[block_begin + lane] = tile[left_count + right];
@@ -235,7 +267,7 @@ void lexsort_cuda(
       merge_pass<32><<<blocks, kThreads, 0, stream>>>(
           input_strings, source, destination, n, run_length);
     } else {
-      merge_pass<64><<<blocks, kThreads, 0, stream>>>(
+      merge_pass<64, true><<<blocks, kThreads, 0, stream>>>(
           input_strings, source, destination, n, run_length);
     }
     const int32_t* completed = destination;
