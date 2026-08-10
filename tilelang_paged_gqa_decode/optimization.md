@@ -5,17 +5,35 @@
 映射后的物理页直接读入 shared memory；每页分别通过 BF16 Tensor Core
 完成 `QK^T` 和 `PV`，Softmax 最大值、归一化因子与输出累加使用 FP32。
 
-短序列和大 batch 使用单 kernel 在线 Softmax。长序列按静态 workload
-切分连续 KV 页，每个 split 独立生成 FP32 partial output 和 log-sum-exp，
-再由单 warp TileLang kernel 做数值稳定的全局合并。公开用例 G1、G2、G3
-分别使用 16、16、8 个 split；G4 不切分。该结构把长请求的页循环分散到
-足够多的 CTA，同时避免大 batch 短请求承担 workspace 写入和第二次 launch。
+短序列和大 batch 使用单 kernel 在线 Softmax。长序列按固定页块切分连续
+KV 页，每个 split 独立生成 FP32 partial output 和 log-sum-exp，再由单
+warp TileLang kernel 做数值稳定的全局合并。kernel 根据运行时
+`seq_lens` 计算有效 split 数，combine 也只读取这些有效 partial，避免
+短请求读取 workspace 中的旧数据。G1、G2 使用 16 个最大 split、每块
+128 页；G3 使用 4 个最大 split、每块 256 页；G4 不切分。direct 和
+split attention CTA 均使用 64 线程，combine 保持 32 线程。
 
 RTX 4090 物理 GPU 6 上，开发阶段 cold-L2 local preset 的公开用例加权
-延迟从未切分版本的 761.640 us 降至 287.615 us。最终 official preset
-测得 G1/G2/G3/G4 分别为 130.554、286.018、428.925、342.230 us，
-加权几何平均为 286.190 us。固定 7 组 correctness、固定 seed 的 5 组
-随机 correctness，以及 4 组公开大 shape correctness 均通过；观测到的
-最大绝对误差为 7.812e-3。
+延迟从未切分版本的 761.640 us 降至 281.123 us。最终 official preset
+测得 G1/G2/G3/G4 分别为 132.297、277.017、412.423、339.495 us，
+加权几何平均为 280.434 us。4 组公开大 shape correctness 均通过，
+`nrmse` 不超过 2.638e-3，最大绝对误差不超过 9.766e-4；固定 7 组
+direct correctness 观测到的最大绝对误差为 7.812e-3。
 
-额外依赖：无。
+开发对照脚本 `benchmark_flashinfer.py` 使用 FlashInfer 0.6.16.post3，
+把 plan 放在计时区外，并复用本题的 cold-L2 计时器。FlashInfer FA2 的
+G1/G2/G3/G4 为 133.234、277.938、441.355、333.005 us，加权
+285.781 us；CUDA-core 后端为 135.441、278.760、412.643、349.861 us，
+加权 284.034 us。当前实现的加权延迟快于任一完整 FlashInfer 后端；若
+逐 shape 选取两个后端的最小值，复合下界为 280.072 us，当前实现慢
+0.129%。
+
+NCU 显示 G4 的当前 kernel 与 FlashInfer 都约为 92% DRAM 吞吐、16.67%
+理论 occupancy。剩余差距主要来自当前静态整页 `T.copy` 读取每条请求的
+无效尾页元素。TileLang 中尝试手写 predicated tail load 和动态 extent
+`T.copy` 后，G4 local 分别退化到 341.313 us 和 344.069 us，因此保留
+静态整页 copy。128-thread CTA、双 stage pipeline 和 K/V shared buffer
+复用同样没有正向信号。
+
+提交实现额外依赖：无。FlashInfer 仅用于开发期对照，不被 `submission.py`
+导入。
