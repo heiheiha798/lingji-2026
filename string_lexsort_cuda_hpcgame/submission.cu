@@ -23,13 +23,37 @@ struct GraphEntry {
 };
 
 
-template <int kWidth, int kStart = 0>
+template <int kWidth, int kStart = 0, bool kCompare64 = false>
 __device__ __forceinline__ bool index_less(
     int32_t lhs,
     int32_t rhs,
     const uint8_t* __restrict__ strings) {
   const uint8_t* lhs_string = strings + static_cast<int64_t>(lhs) * kWidth;
   const uint8_t* rhs_string = strings + static_cast<int64_t>(rhs) * kWidth;
+  if constexpr (kCompare64) {
+    static_assert(kStart % 8 == 0 && kWidth % 8 == 0);
+#pragma unroll
+    for (int32_t offset = kStart; offset < kWidth; offset += 8) {
+      const uint64_t lhs_raw =
+          *reinterpret_cast<const uint64_t*>(lhs_string + offset);
+      const uint64_t rhs_raw =
+          *reinterpret_cast<const uint64_t*>(rhs_string + offset);
+      const uint64_t lhs_big_endian =
+          (static_cast<uint64_t>(__byte_perm(
+               static_cast<uint32_t>(lhs_raw), 0, 0x0123))
+           << 32) |
+          __byte_perm(static_cast<uint32_t>(lhs_raw >> 32), 0, 0x0123);
+      const uint64_t rhs_big_endian =
+          (static_cast<uint64_t>(__byte_perm(
+               static_cast<uint32_t>(rhs_raw), 0, 0x0123))
+           << 32) |
+          __byte_perm(static_cast<uint32_t>(rhs_raw >> 32), 0, 0x0123);
+      if (lhs_big_endian != rhs_big_endian) {
+        return lhs_big_endian < rhs_big_endian;
+      }
+    }
+    return lhs < rhs;
+  }
 #pragma unroll
   for (int32_t offset = kStart; offset < kWidth; offset += 4) {
     const uint32_t lhs_word =
@@ -218,7 +242,7 @@ __global__ void merge_pass(
       const int32_t left = (low + high) >> 1;
       const int32_t right = diagonal - left;
       if (left < left_length && right > 0 &&
-          index_less<kWidth>(
+          index_less<kWidth, 0, kCacheFullKey>(
               source[pair_begin + left],
               source[right_begin + right - 1],
               strings)) {
