@@ -145,8 +145,12 @@ void LaunchSweepTyped(const Height *input, Height *output,
 void LaunchInitialize(const std::uint32_t *input, void *height_a,
                       void *height_b, std::uint64_t *odometer, std::size_t n,
                       int rows, int cols, int *bounds, bool find_bounds,
-                      bool use_short_heights, cudaStream_t stream) {
-  if (use_short_heights) {
+                      int height_width, cudaStream_t stream) {
+  if (height_width == 1) {
+    LaunchInitializeTyped(input, static_cast<std::uint8_t *>(height_a),
+                          static_cast<std::uint8_t *>(height_b), odometer, n,
+                          rows, cols, bounds, find_bounds, stream);
+  } else if (height_width == 2) {
     LaunchInitializeTyped(input, static_cast<std::uint16_t *>(height_a),
                           static_cast<std::uint16_t *>(height_b), odometer, n,
                           rows, cols, bounds, find_bounds, stream);
@@ -159,9 +163,13 @@ void LaunchInitialize(const std::uint32_t *input, void *height_a,
 
 void LaunchSweep(const void *input, void *output, std::uint64_t *odometer,
                  int rows, int cols, int x_begin, int y_begin, int x_end,
-                 int y_end, bool bounded, int *active, bool use_short_heights,
+                 int y_end, bool bounded, int *active, int height_width,
                  cudaStream_t stream) {
-  if (use_short_heights) {
+  if (height_width == 1) {
+    LaunchSweepTyped(static_cast<const std::uint8_t *>(input),
+                     static_cast<std::uint8_t *>(output), odometer, rows, cols,
+                     x_begin, y_begin, x_end, y_end, bounded, active, stream);
+  } else if (height_width == 2) {
     LaunchSweepTyped(static_cast<const std::uint16_t *>(input),
                      static_cast<std::uint16_t *>(output), odometer, rows,
                      cols, x_begin, y_begin, x_end, y_end, bounded, active,
@@ -175,8 +183,12 @@ void LaunchSweep(const void *input, void *output, std::uint64_t *odometer,
 }
 
 void LaunchStore(const void *height, std::uint8_t *stable, std::size_t n,
-                 bool use_short_heights, cudaStream_t stream) {
-  if (use_short_heights) {
+                 int height_width, cudaStream_t stream) {
+  if (height_width == 1) {
+    StoreKernel<std::uint8_t>
+        <<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(
+            static_cast<const std::uint8_t *>(height), stable, n);
+  } else if (height_width == 2) {
     StoreKernel<std::uint16_t>
         <<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(
             static_cast<const std::uint16_t *>(height), stable, n);

@@ -47,15 +47,15 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
   for (std::size_t i = 0; i < n; ++i) {
     if (initial[i] > max_initial) max_initial = initial[i];
   }
-  const bool use_short_heights = max_initial <= 65535U;
+  const int height_width = max_initial <= 255U ? 1 :
+                           (max_initial <= 65535U ? 2 : 4);
   int sampled_active = 0;
   for (std::size_t sample = 0; sample < 256; ++sample) {
     const std::size_t i = sample * n / 256;
     sampled_active += initial[i] >= 4U;
   }
   const bool dense = sampled_active >= 4;
-  const std::size_t height_bytes =
-      n * (use_short_heights ? sizeof(std::uint16_t) : sizeof(std::uint32_t));
+  const std::size_t height_bytes = n * static_cast<std::size_t>(height_width);
   DeviceResources d;
   if (!CudaOk(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking)) ||
       !CudaOk(cudaMalloc(&d.initial, n * sizeof(std::uint32_t))) ||
@@ -79,7 +79,7 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
     }
   }
   LaunchInitialize(d.initial, a, b, d.odometer, n, rows, cols, d.active + 1,
-                   !dense, use_short_heights, d.stream);
+                   !dense, height_width, d.stream);
   if (!CudaOk(cudaGetLastError())) {
     return 2;
   }
@@ -108,8 +108,7 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
       if (y_end < rows) ++y_end;
       LaunchSweep(a, b, d.odometer, rows, cols, x_begin, y_begin, x_end, y_end,
                   x_begin != 0 || y_begin != 0 || x_end != cols || y_end != rows,
-                  sweep == 15 ? d.active : nullptr, use_short_heights,
-                  d.stream);
+                  sweep == 15 ? d.active : nullptr, height_width, d.stream);
       if (!CudaOk(cudaGetLastError())) {
         return 2;
       }
@@ -123,7 +122,7 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
       return 2;
     }
   }
-  LaunchStore(a, d.stable, n, use_short_heights, d.stream);
+  LaunchStore(a, d.stable, n, height_width, d.stream);
   if (!CudaOk(cudaGetLastError()) ||
       !CudaOk(cudaMemcpyAsync(stable, d.stable, n * sizeof(std::uint8_t),
                               cudaMemcpyDeviceToHost, d.stream)) ||
