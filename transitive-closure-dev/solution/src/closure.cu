@@ -224,6 +224,7 @@ __global__ void CloseOrderedBlocksCooperative(
     int *global_neighbors, int *fully_connected_flag, int vertices, int words,
     int neighbor_capacity) {
   __shared__ int neighbor_count;
+  __shared__ int direct_neighbors[kOrderedBlockMaximumDegree];
   const cooperative_groups::grid_group grid = cooperative_groups::this_grid();
   const int row_offset = blockIdx.x;
   const int word_tile = blockIdx.y;
@@ -248,45 +249,33 @@ __global__ void CloseOrderedBlocksCooperative(
     const bool representative =
         active && representatives[row] == row;
     if (*fully_connected_flag != 0) {
-      if (word_tile == 0) {
-        if (threadIdx.x == 0) neighbor_count = 0;
-        __syncthreads();
-        if (active) {
-          const std::size_t base = static_cast<std::size_t>(row) * words;
-          for (int word = block_start / 64 + 1 + threadIdx.x; word < words;
-               word += blockDim.x) {
-            std::uint64_t remaining = reach[base + word];
-            while (remaining != 0) {
-              const int bit = __ffsll(static_cast<long long>(remaining)) - 1;
-              const int position = atomicAdd(&neighbor_count, 1);
-              global_neighbors[row_offset * neighbor_capacity + position] =
-                  word * 64 + bit;
-              remaining &= remaining - 1;
-            }
-          }
+      if (threadIdx.x == 0) neighbor_count = 0;
+      __syncthreads();
+      const std::size_t base = static_cast<std::size_t>(row) * words;
+      for (int word = block_start / 64 + 1 + threadIdx.x; word < words;
+           word += blockDim.x) {
+        std::uint64_t remaining = reach[base + word];
+        while (remaining != 0) {
+          const int bit = __ffsll(static_cast<long long>(remaining)) - 1;
+          const int position = atomicAdd(&neighbor_count, 1);
+          direct_neighbors[position] = word * 64 + bit;
+          remaining &= remaining - 1;
         }
-        __syncthreads();
-        if (threadIdx.x == 0 && active)
-          global_neighbor_counts[row_offset] = neighbor_count;
       }
-      grid.sync();
-
-      if (active) {
-        const std::size_t scratch_base =
-            static_cast<std::size_t>(row_offset) * words;
-        const int count = global_neighbor_counts[row_offset];
-        for (int word = word_tile * blockDim.x + threadIdx.x; word < words;
-             word += word_tiles * blockDim.x) {
-          std::uint64_t output = 0;
-          for (int index = 0; index < count; ++index) {
-            const int target =
-                global_neighbors[row_offset * neighbor_capacity + index];
-            output |= reach[static_cast<std::size_t>(representatives[target]) *
-                                words +
-                            word];
-          }
-          block_rows[scratch_base + word] = output;
+      __syncthreads();
+      const std::size_t scratch_base =
+          static_cast<std::size_t>(row_offset) * words;
+      const int count = neighbor_count;
+      for (int word = word_tile * blockDim.x + threadIdx.x; word < words;
+           word += word_tiles * blockDim.x) {
+        std::uint64_t output = 0;
+        for (int index = 0; index < count; ++index) {
+          const int target = direct_neighbors[index];
+          output |= reach[static_cast<std::size_t>(representatives[target]) *
+                              words +
+                          word];
         }
+        block_rows[scratch_base + word] = output;
       }
       grid.sync();
 
@@ -304,9 +293,12 @@ __global__ void CloseOrderedBlocksCooperative(
         }
       }
     } else {
+      const std::uint64_t internal_mask =
+          representative
+              ? reach[static_cast<std::size_t>(row) * words +
+                      block_start / 64]
+              : 0;
       if (representative) {
-        std::uint64_t internal_mask =
-            reach[static_cast<std::size_t>(row) * words + block_start / 64];
         for (int word = word_tile * blockDim.x + threadIdx.x; word < words;
              word += word_tiles * blockDim.x) {
           std::uint64_t remaining = internal_mask;
@@ -322,17 +314,24 @@ __global__ void CloseOrderedBlocksCooperative(
               output;
         }
       }
-      grid.sync();
 
       if (word_tile == 0) {
         if (threadIdx.x == 0) neighbor_count = 0;
         __syncthreads();
         if (representative) {
-          const std::size_t scratch_base =
-              static_cast<std::size_t>(row_offset) * words;
           for (int word = block_start / 64 + 1 + threadIdx.x; word < words;
                word += blockDim.x) {
-            std::uint64_t remaining = block_rows[scratch_base + word];
+            std::uint64_t remaining_sources = internal_mask;
+            std::uint64_t remaining = 0;
+            while (remaining_sources != 0) {
+              const int source =
+                  __ffsll(static_cast<long long>(remaining_sources)) - 1;
+              remaining |=
+                  reach[static_cast<std::size_t>(block_start + source) *
+                            words +
+                        word];
+              remaining_sources &= remaining_sources - 1;
+            }
             while (remaining != 0) {
               const int bit = __ffsll(static_cast<long long>(remaining)) - 1;
               const int position = atomicAdd(&neighbor_count, 1);
