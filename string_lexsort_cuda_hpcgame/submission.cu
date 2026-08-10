@@ -228,13 +228,29 @@ __global__ void merge_pass(
           strings + static_cast<int64_t>(index) * kWidth);
       tile_prefixes[lane] = __byte_perm(first_word, 0, 0x0123);
     } else if constexpr (kCacheFullKey) {
-#pragma unroll
-      for (int32_t word = 0; word < kWidth / 4; ++word) {
-        const uint32_t key_word = *reinterpret_cast<const uint32_t*>(
-            strings + static_cast<int64_t>(index) * kWidth + word * 4);
-        tile_keys[word * kThreads + lane] =
-            __byte_perm(key_word, 0, 0x0123);
-      }
+      static_assert(kWidth == 32);
+      const uint8_t* string =
+          strings + static_cast<int64_t>(index) * kWidth;
+      const uint4 first_half =
+          *reinterpret_cast<const uint4*>(string);
+      const uint4 second_half =
+          *reinterpret_cast<const uint4*>(string + sizeof(uint4));
+      tile_keys[0 * kThreads + lane] =
+          __byte_perm(first_half.x, 0, 0x0123);
+      tile_keys[1 * kThreads + lane] =
+          __byte_perm(first_half.y, 0, 0x0123);
+      tile_keys[2 * kThreads + lane] =
+          __byte_perm(first_half.z, 0, 0x0123);
+      tile_keys[3 * kThreads + lane] =
+          __byte_perm(first_half.w, 0, 0x0123);
+      tile_keys[4 * kThreads + lane] =
+          __byte_perm(second_half.x, 0, 0x0123);
+      tile_keys[5 * kThreads + lane] =
+          __byte_perm(second_half.y, 0, 0x0123);
+      tile_keys[6 * kThreads + lane] =
+          __byte_perm(second_half.z, 0, 0x0123);
+      tile_keys[7 * kThreads + lane] =
+          __byte_perm(second_half.w, 0, 0x0123);
     }
   }
   __syncthreads();
