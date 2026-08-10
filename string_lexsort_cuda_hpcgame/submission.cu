@@ -31,9 +31,24 @@ __device__ __forceinline__ bool index_less(
   const uint8_t* lhs_string = strings + static_cast<int64_t>(lhs) * kWidth;
   const uint8_t* rhs_string = strings + static_cast<int64_t>(rhs) * kWidth;
   if constexpr (kCompare64) {
-    static_assert(kStart % 8 == 0 && kWidth % 8 == 0);
+    static_assert(kStart % 8 == 0 || kStart % 8 == 4);
+    static_assert(kWidth % 8 == 0);
+    if constexpr (kStart % 8 == 4) {
+      const uint32_t lhs_word =
+          *reinterpret_cast<const uint32_t*>(lhs_string + kStart);
+      const uint32_t rhs_word =
+          *reinterpret_cast<const uint32_t*>(rhs_string + kStart);
+      if (lhs_word != rhs_word) {
+        const uint32_t lhs_big_endian =
+            __byte_perm(lhs_word, 0, 0x0123);
+        const uint32_t rhs_big_endian =
+            __byte_perm(rhs_word, 0, 0x0123);
+        return lhs_big_endian < rhs_big_endian;
+      }
+    }
+    constexpr int32_t kWideStart = (kStart + 7) & ~7;
 #pragma unroll
-    for (int32_t offset = kStart; offset < kWidth; offset += 8) {
+    for (int32_t offset = kWideStart; offset < kWidth; offset += 8) {
       const uint64_t lhs_raw =
           *reinterpret_cast<const uint64_t*>(lhs_string + offset);
       const uint64_t rhs_raw =
@@ -177,7 +192,7 @@ __global__ void sort_tiles(
                       (kCacheSuffix
                            ? shared_global_suffix_less<kWidth>(
                                  rhs, lhs, block_begin, suffixes)
-                           : index_less<kWidth, 4>(
+                           : index_less<kWidth, 4, kWidth == 32>(
                                  rhs, lhs, strings))));
         } else {
           exchange = rhs == INT32_MAX
@@ -188,7 +203,7 @@ __global__ void sort_tiles(
                       (kCacheSuffix
                            ? shared_global_suffix_less<kWidth>(
                                  lhs, rhs, block_begin, suffixes)
-                           : index_less<kWidth, 4>(
+                           : index_less<kWidth, 4, kWidth == 32>(
                                  lhs, rhs, strings))));
         }
         if (exchange) {
