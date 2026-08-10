@@ -93,6 +93,15 @@ __global__ void ApplyPivotBlock(std::uint64_t *reach,
   selected_mask = __shfl_sync(0xffffffffU, selected_mask, 0);
   if (selected_mask == 0) return;
 
+  if ((selected_mask & (selected_mask - 1)) == 0) {
+    const int source = __ffsll(static_cast<long long>(selected_mask)) - 1;
+    for (int word = threadIdx.x; word < words; word += blockDim.x) {
+      reach[base + word] |=
+          pivot_rows[static_cast<std::size_t>(source) * words + word];
+    }
+    return;
+  }
+
   for (int word = threadIdx.x; word < words; word += blockDim.x) {
     std::uint64_t output = reach[base + word];
     std::uint64_t remaining = selected_mask;
