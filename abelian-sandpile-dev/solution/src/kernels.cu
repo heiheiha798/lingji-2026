@@ -59,40 +59,116 @@ __global__ void InitializeBoundedKernel(const std::uint32_t *input,
 }
 
 template <typename Height, bool CheckActive, bool Bounded>
-__global__ void SweepKernel(const Height *__restrict__ input,
-                            Height *__restrict__ output,
-                            std::uint64_t *__restrict__ odometer, int rows,
-                            int cols, int x_begin, int y_begin, int x_end,
-                            int y_end, int *active) {
-  const int x = (Bounded ? x_begin : 0) +
-                blockIdx.x * blockDim.x + threadIdx.x;
-  const int y = (Bounded ? y_begin : 0) +
-                blockIdx.y * blockDim.y + threadIdx.y;
-  if (x >= (Bounded ? x_end : cols) || y >= (Bounded ? y_end : rows)) return;
+__global__ __launch_bounds__(256) void SweepKernel(
+    const Height *__restrict__ input, Height *__restrict__ output,
+    std::uint64_t *__restrict__ odometer, int rows, int cols, int x_begin,
+    int y_begin, int x_end, int y_end, int *active) {
+  constexpr int kSteps = 4;
+  constexpr int kTileCols = 32;
+  constexpr int kTileRows = 32;
+  constexpr int kSharedCols = kTileCols + 2 * kSteps;
+  constexpr int kSharedRows = kTileRows + 2 * kSteps;
+  constexpr int kSharedCells = kSharedCols * kSharedRows;
+  constexpr int kOutputsPerThread = kTileCols * kTileRows / 256;
+  __shared__ std::uint32_t shared_a[kSharedCells];
+  __shared__ std::uint32_t shared_b[kSharedCells];
 
-  const std::size_t i = static_cast<std::size_t>(y) * cols + x;
-  const std::uint32_t h = input[i];
-  const std::uint32_t q = h >> 2;
-  std::uint32_t next = h & 3U;
-  if (x > 0) next += input[i - 1] >> 2;
-  if (x + 1 < cols) next += input[i + 1] >> 2;
-  if (y > 0) next += input[i - cols] >> 2;
-  if (y + 1 < rows) next += input[i + cols] >> 2;
-  output[i] = static_cast<Height>(next);
-  if (q != 0) {
-    odometer[i] += q;
+  const int thread_id = threadIdx.x;
+  const int tile_x = (Bounded ? x_begin : 0) + blockIdx.x * kTileCols;
+  const int tile_y = (Bounded ? y_begin : 0) + blockIdx.y * kTileRows;
+  const int output_x_end = Bounded ? x_end : cols;
+  const int output_y_end = Bounded ? y_end : rows;
+
+  for (int shared_i = thread_id; shared_i < kSharedCells;
+       shared_i += blockDim.x) {
+    const int shared_y = shared_i / kSharedCols;
+    const int shared_x = shared_i - shared_y * kSharedCols;
+    const int x = tile_x + shared_x - kSteps;
+    const int y = tile_y + shared_y - kSteps;
+    shared_a[shared_i] =
+        x >= 0 && x < cols && y >= 0 && y < rows
+            ? input[static_cast<std::size_t>(y) * cols + x]
+            : 0U;
+  }
+  __syncthreads();
+
+  std::uint64_t topples[kOutputsPerThread] = {};
+  bool thread_active = false;
+  std::uint32_t *source = shared_a;
+  std::uint32_t *destination = shared_b;
+#pragma unroll
+  for (int step = 0; step < kSteps; ++step) {
+#pragma unroll
+    for (int item = 0; item < kOutputsPerThread; ++item) {
+      const int output_i = thread_id + item * blockDim.x;
+      const int output_y = output_i / kTileCols;
+      const int output_x = output_i - output_y * kTileCols;
+      const std::uint32_t q =
+          source[(output_y + kSteps) * kSharedCols + output_x + kSteps] >> 2;
+      topples[item] += q;
+      if constexpr (CheckActive) {
+        if (step == kSteps - 1) {
+          const int x = tile_x + output_x;
+          const int y = tile_y + output_y;
+          thread_active |= x < output_x_end && y < output_y_end && q != 0;
+        }
+      }
+    }
+
+    const int inset = step + 1;
+    for (int shared_i = thread_id; shared_i < kSharedCells;
+         shared_i += blockDim.x) {
+      const int shared_y = shared_i / kSharedCols;
+      const int shared_x = shared_i - shared_y * kSharedCols;
+      if (shared_x >= inset && shared_x < kSharedCols - inset &&
+          shared_y >= inset && shared_y < kSharedRows - inset) {
+        const std::uint32_t h = source[shared_i];
+        destination[shared_i] =
+            (h & 3U) + (source[shared_i - 1] >> 2) +
+            (source[shared_i + 1] >> 2) +
+            (source[shared_i - kSharedCols] >> 2) +
+            (source[shared_i + kSharedCols] >> 2);
+      }
+    }
+    if (tile_x < kSteps || tile_y < kSteps ||
+        tile_x + kTileCols + kSteps > cols ||
+        tile_y + kTileRows + kSteps > rows) {
+      for (int shared_i = thread_id; shared_i < kSharedCells;
+           shared_i += blockDim.x) {
+        const int shared_y = shared_i / kSharedCols;
+        const int shared_x = shared_i - shared_y * kSharedCols;
+        const int x = tile_x + shared_x - kSteps;
+        const int y = tile_y + shared_y - kSteps;
+        if (x < 0 || x >= cols || y < 0 || y >= rows) {
+          destination[shared_i] = 0U;
+        }
+      }
+    }
+    __syncthreads();
+    std::uint32_t *temporary = source;
+    source = destination;
+    destination = temporary;
+  }
+
+#pragma unroll
+  for (int item = 0; item < kOutputsPerThread; ++item) {
+    const int output_i = thread_id + item * blockDim.x;
+    const int output_y = output_i / kTileCols;
+    const int output_x = output_i - output_y * kTileCols;
+    const int x = tile_x + output_x;
+    const int y = tile_y + output_y;
+    if (x < output_x_end && y < output_y_end) {
+      const std::size_t i = static_cast<std::size_t>(y) * cols + x;
+      output[i] = static_cast<Height>(
+          source[(output_y + kSteps) * kSharedCols + output_x + kSteps]);
+      if (topples[item] != 0) odometer[i] += topples[item];
+    }
   }
   if constexpr (CheckActive) {
-    if constexpr (Bounded) {
-      if (q != 0) atomicExch(active, 1);
-    } else {
-      const unsigned int active_lanes = __activemask();
-      const unsigned int unstable_lanes =
-          __ballot_sync(active_lanes, q != 0);
-      if (unstable_lanes != 0U &&
-          (threadIdx.x & 31) == __ffs(unstable_lanes) - 1) {
-        atomicExch(active, 1);
-      }
+    const unsigned int unstable_lanes =
+        __ballot_sync(0xffffffffU, thread_active);
+    if ((thread_id & 31) == 0 && unstable_lanes != 0U) {
+      atomicExch(active, 1);
     }
   }
 }
@@ -128,11 +204,13 @@ void LaunchSweepTyped(const Height *input, Height *output,
                       std::uint64_t *odometer, int rows, int cols, int x_begin,
                       int y_begin, int x_end, int y_end, bool bounded,
                       int *active, cudaStream_t stream) {
-  const dim3 block(32, 8);
+  constexpr unsigned int kTileCols = 32;
+  constexpr unsigned int kTileRows = 32;
+  const dim3 block(256);
   const unsigned int width = bounded ? x_end - x_begin : cols;
   const unsigned int height = bounded ? y_end - y_begin : rows;
-  const dim3 grid((width + block.x - 1) / block.x,
-                  (height + block.y - 1) / block.y);
+  const dim3 grid((width + kTileCols - 1) / kTileCols,
+                  (height + kTileRows - 1) / kTileRows);
   if (bounded && active == nullptr) {
     SweepKernel<Height, false, true><<<grid, block, 0, stream>>>(
         input, output, odometer, rows, cols, x_begin, y_begin, x_end, y_end,
