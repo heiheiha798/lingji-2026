@@ -449,7 +449,7 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   const unsigned int rows =
       num_cells / static_cast<std::uint32_t>(input->nx - 1);
   const bool use_row_path =
-      input->num_isovalues == 2 ||
+      input->num_isovalues == 2 || input->num_isovalues == 4 ||
       input->num_isovalues == icecarver::kMaxIsovalues;
 
   std::size_t scan_temp_bytes = 0;
@@ -559,6 +559,10 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
     classify_cells_by_row<2><<<rows, kRowThreads, 0, stream>>>(
         input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
         num_cells, input->isovalues, counts, offsets);
+  } else if (input->num_isovalues == 4) {
+    classify_cells_by_row<4><<<rows, kRowThreads, 0, stream>>>(
+        input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
+        num_cells, input->isovalues, counts, offsets);
   } else if (input->num_isovalues == icecarver::kMaxIsovalues) {
     classify_cells_by_row<icecarver::kMaxIsovalues>
         <<<rows, kRowThreads, 0, stream>>>(
@@ -610,6 +614,12 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
         static_cast<unsigned int>(kEmitWarps);
     if (input->num_isovalues == 2) {
       generate_triangles_by_row<2><<<row_blocks, kRowThreads, 0, stream>>>(
+          input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
+          rows, input->isovalues, counts,
+          offsets + static_cast<std::size_t>(input->num_isovalues) * rows,
+          *output);
+    } else if (input->num_isovalues == 4) {
+      generate_triangles_by_row<4><<<row_blocks, kRowThreads, 0, stream>>>(
           input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
           rows, input->isovalues, counts,
           offsets + static_cast<std::size_t>(input->num_isovalues) * rows,
