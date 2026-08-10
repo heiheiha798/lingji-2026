@@ -12,14 +12,15 @@ namespace {
 constexpr int kThreads = 256;
 
 
+template <int kWidth>
 __device__ __forceinline__ bool index_less(
     int32_t lhs,
     int32_t rhs,
-    const uint8_t* __restrict__ strings,
-    int32_t width) {
-  const uint8_t* lhs_string = strings + static_cast<int64_t>(lhs) * width;
-  const uint8_t* rhs_string = strings + static_cast<int64_t>(rhs) * width;
-  for (int32_t offset = 0; offset < width; offset += 4) {
+    const uint8_t* __restrict__ strings) {
+  const uint8_t* lhs_string = strings + static_cast<int64_t>(lhs) * kWidth;
+  const uint8_t* rhs_string = strings + static_cast<int64_t>(rhs) * kWidth;
+#pragma unroll
+  for (int32_t offset = 0; offset < kWidth; offset += 4) {
     const uint32_t lhs_word =
         *reinterpret_cast<const uint32_t*>(lhs_string + offset);
     const uint32_t rhs_word =
@@ -34,11 +35,11 @@ __device__ __forceinline__ bool index_less(
 }
 
 
+template <int kWidth>
 __global__ void sort_tiles(
     const uint8_t* __restrict__ strings,
     int32_t* __restrict__ indices,
-    int32_t n,
-    int32_t width) {
+    int32_t n) {
   __shared__ int32_t tile[kThreads];
 
   const int32_t lane = static_cast<int32_t>(threadIdx.x);
@@ -57,11 +58,11 @@ __global__ void sort_tiles(
         if (ascending) {
           exchange = lhs == INT32_MAX
               ? rhs != INT32_MAX
-              : rhs != INT32_MAX && index_less(rhs, lhs, strings, width);
+              : rhs != INT32_MAX && index_less<kWidth>(rhs, lhs, strings);
         } else {
           exchange = rhs == INT32_MAX
               ? lhs != INT32_MAX
-              : lhs != INT32_MAX && index_less(lhs, rhs, strings, width);
+              : lhs != INT32_MAX && index_less<kWidth>(lhs, rhs, strings);
         }
         if (exchange) {
           tile[lane] = rhs;
@@ -78,12 +79,12 @@ __global__ void sort_tiles(
 }
 
 
+template <int kWidth>
 __global__ void merge_pass(
     const uint8_t* __restrict__ strings,
     const int32_t* __restrict__ source,
     int32_t* __restrict__ destination,
     int32_t n,
-    int32_t width,
     int32_t run_length) {
   __shared__ int32_t tile[kThreads];
   __shared__ int32_t block_partitions[2];
@@ -106,11 +107,10 @@ __global__ void merge_pass(
       const int32_t left = (low + high) >> 1;
       const int32_t right = diagonal - left;
       if (left < left_length && right > 0 &&
-          index_less(
+          index_less<kWidth>(
               source[pair_begin + left],
               source[right_begin + right - 1],
-              strings,
-              width)) {
+              strings)) {
         low = left + 1;
       } else {
         high = left;
@@ -141,11 +141,10 @@ __global__ void merge_pass(
     const int32_t left = (low + high) >> 1;
     const int32_t right = lane - left;
     if (left < left_count && right > 0 &&
-        index_less(
+        index_less<kWidth>(
             tile[left],
             tile[left_count + right - 1],
-            strings,
-            width)) {
+            strings)) {
       low = left + 1;
     } else {
       high = left;
@@ -156,11 +155,10 @@ __global__ void merge_pass(
   const int32_t right = lane - left;
   if (left < left_count &&
       (right >= right_count ||
-       index_less(
+       index_less<kWidth>(
            tile[left],
            tile[left_count + right],
-           strings,
-           width))) {
+           strings))) {
     destination[block_begin + lane] = tile[left];
   } else {
     destination[block_begin + lane] = tile[left_count + right];
@@ -198,20 +196,30 @@ void lexsort_cuda(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int32_t blocks = (n + kThreads - 1) / kThreads;
 
-  sort_tiles<<<blocks, kThreads, 0, stream>>>(input_strings, output, n, width);
+  if (width == 16) {
+    sort_tiles<16><<<blocks, kThreads, 0, stream>>>(input_strings, output, n);
+  } else if (width == 32) {
+    sort_tiles<32><<<blocks, kThreads, 0, stream>>>(input_strings, output, n);
+  } else {
+    TORCH_CHECK(width == 64, "unsupported string width: ", width);
+    sort_tiles<64><<<blocks, kThreads, 0, stream>>>(input_strings, output, n);
+  }
 
   const int32_t* source = output;
   int32_t* destination = scratch;
   for (int32_t run_length = kThreads;
        run_length < n;
        run_length <<= 1) {
-    merge_pass<<<blocks, kThreads, 0, stream>>>(
-        input_strings,
-        source,
-        destination,
-        n,
-        width,
-        run_length);
+    if (width == 16) {
+      merge_pass<16><<<blocks, kThreads, 0, stream>>>(
+          input_strings, source, destination, n, run_length);
+    } else if (width == 32) {
+      merge_pass<32><<<blocks, kThreads, 0, stream>>>(
+          input_strings, source, destination, n, run_length);
+    } else {
+      merge_pass<64><<<blocks, kThreads, 0, stream>>>(
+          input_strings, source, destination, n, run_length);
+    }
     const int32_t* completed = destination;
     destination = const_cast<int32_t*>(source);
     source = completed;
