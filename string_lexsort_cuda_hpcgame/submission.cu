@@ -47,6 +47,24 @@ __device__ __forceinline__ bool index_less(
 
 
 template <int kWidth>
+__device__ __forceinline__ bool shared_index_less(
+    int32_t lhs_position,
+    int32_t rhs_position,
+    const int32_t* __restrict__ indices,
+    const uint32_t* __restrict__ keys) {
+#pragma unroll
+  for (int32_t word = 0; word < kWidth / 4; ++word) {
+    const uint32_t lhs_word = keys[word * kThreads + lhs_position];
+    const uint32_t rhs_word = keys[word * kThreads + rhs_position];
+    if (lhs_word != rhs_word) {
+      return lhs_word < rhs_word;
+    }
+  }
+  return indices[lhs_position] < indices[rhs_position];
+}
+
+
+template <int kWidth>
 __global__ void sort_tiles(
     const uint8_t* __restrict__ strings,
     int32_t* __restrict__ indices,
@@ -108,7 +126,10 @@ __global__ void sort_tiles(
 }
 
 
-template <int kWidth, bool kCachePrefix = false>
+template <
+    int kWidth,
+    bool kCachePrefix = false,
+    bool kCacheFullKey = false>
 __global__ void merge_pass(
     const uint8_t* __restrict__ strings,
     const int32_t* __restrict__ source,
@@ -118,6 +139,8 @@ __global__ void merge_pass(
   __shared__ int32_t tile[kThreads];
   __shared__ uint32_t tile_prefixes[kCachePrefix ? kThreads : 1];
   __shared__ int32_t block_partitions[2];
+  extern __shared__ uint32_t tile_keys[];
+  static_assert(!(kCachePrefix && kCacheFullKey));
 
   const int32_t lane = static_cast<int32_t>(threadIdx.x);
   const int32_t block_begin = static_cast<int32_t>(blockIdx.x * kThreads);
@@ -163,6 +186,14 @@ __global__ void merge_pass(
       const uint32_t first_word = *reinterpret_cast<const uint32_t*>(
           strings + static_cast<int64_t>(index) * kWidth);
       tile_prefixes[lane] = __byte_perm(first_word, 0, 0x0123);
+    } else if constexpr (kCacheFullKey) {
+#pragma unroll
+      for (int32_t word = 0; word < kWidth / 4; ++word) {
+        const uint32_t key_word = *reinterpret_cast<const uint32_t*>(
+            strings + static_cast<int64_t>(index) * kWidth + word * 4);
+        tile_keys[word * kThreads + lane] =
+            __byte_perm(key_word, 0, 0x0123);
+      }
     }
   }
   __syncthreads();
@@ -178,7 +209,13 @@ __global__ void merge_pass(
     const int32_t right = lane - left;
     if (left < left_count && right > 0) {
       bool left_before_right;
-      if constexpr (kCachePrefix) {
+      if constexpr (kCacheFullKey) {
+        left_before_right = shared_index_less<kWidth>(
+            left,
+            left_count + right - 1,
+            tile,
+            tile_keys);
+      } else if constexpr (kCachePrefix) {
         const uint32_t left_prefix = tile_prefixes[left];
         const uint32_t right_prefix = tile_prefixes[left_count + right - 1];
         left_before_right = left_prefix < right_prefix ||
@@ -207,7 +244,10 @@ __global__ void merge_pass(
   const int32_t right = lane - left;
   bool take_left = left < left_count && right >= right_count;
   if (left < left_count && right < right_count) {
-    if constexpr (kCachePrefix) {
+    if constexpr (kCacheFullKey) {
+      take_left = shared_index_less<kWidth>(
+          left, left_count + right, tile, tile_keys);
+    } else if constexpr (kCachePrefix) {
       const uint32_t left_prefix = tile_prefixes[left];
       const uint32_t right_prefix = tile_prefixes[left_count + right];
       take_left = left_prefix < right_prefix ||
@@ -309,7 +349,11 @@ void lexsort_cuda(
       merge_pass<16><<<blocks, kThreads, 0, capture_stream>>>(
           input_strings, source, destination, n, run_length);
     } else if (width == 32) {
-      merge_pass<32><<<blocks, kThreads, 0, capture_stream>>>(
+      merge_pass<32, false, true><<<
+          blocks,
+          kThreads,
+          (32 / 4) * kThreads * sizeof(uint32_t),
+          capture_stream>>>(
           input_strings, source, destination, n, run_length);
     } else {
       merge_pass<64, true><<<blocks, kThreads, 0, capture_stream>>>(
