@@ -1,0 +1,188 @@
+{
+  "generated_at_utc": "2026-08-10T03:02:11+00:00",
+  "solution_dir": "/data/home/tianjianyang/code/tmp/lingji-2026-agents/transitive-closure/transitive-closure-dev/solution",
+  "command": [
+    "/data/home/tianjianyang/miniconda3/bin/python3",
+    "run_judge.py",
+    "--random-seed",
+    "987654321",
+    "--json-output",
+    "solution/benchmark.json"
+  ],
+  "environment": {
+    "platform": "Linux-6.14.0-27-generic-x86_64-with-glibc2.39",
+    "python": "3.13.9",
+    "nvcc": "Build cuda_13.0.r13.0/compiler.36424714_0",
+    "gpu": "NVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB"
+  },
+  "functional": {
+    "status": "PASS",
+    "seed": 987654321,
+    "cases": [
+      {
+        "name": "random-layered-dag",
+        "status": "PASS",
+        "correct": true,
+        "vertices": 151,
+        "seed": 11400714818354943140
+      },
+      {
+        "name": "random-block-scc",
+        "status": "PASS",
+        "correct": true,
+        "vertices": 125,
+        "seed": 4354685563958890651
+      },
+      {
+        "name": "random-sparse",
+        "status": "PASS",
+        "correct": true,
+        "vertices": 102,
+        "seed": 15755400383339502734
+      },
+      {
+        "name": "random-grid-dag",
+        "status": "PASS",
+        "correct": true,
+        "vertices": 99,
+        "seed": 8709371128981199077
+      },
+      {
+        "name": "random-mixed",
+        "status": "PASS",
+        "correct": true,
+        "vertices": 123,
+        "seed": 1663341874584880344
+      }
+    ]
+  },
+  "performance": [
+    {
+      "case_id": 0,
+      "name": "tiny-correctness",
+      "status": "PASS",
+      "correct": true,
+      "time_ms": 235.166518,
+      "samples_ms": [
+        236.480746,
+        234.270324,
+        235.166518
+      ],
+      "reference_ms": 239.609522,
+      "reference_samples_ms": [
+        240.1047,
+        236.705039,
+        239.609522
+      ],
+      "speedup": 1.0188930126524218,
+      "seed": 101,
+      "guards_intact": true
+    },
+    {
+      "case_id": 1,
+      "name": "layered-dag",
+      "status": "PASS",
+      "correct": true,
+      "time_ms": 289.296031,
+      "samples_ms": [
+        281.400783,
+        289.296031,
+        299.447991
+      ],
+      "reference_ms": 436.76729,
+      "reference_samples_ms": [
+        466.022218,
+        436.74472,
+        436.76729
+      ],
+      "speedup": 1.5097590122140319,
+      "seed": 202,
+      "guards_intact": true
+    },
+    {
+      "case_id": 2,
+      "name": "block-scc",
+      "status": "PASS",
+      "correct": true,
+      "time_ms": 610.955898,
+      "samples_ms": [
+        627.241266,
+        605.082146,
+        610.955898
+      ],
+      "reference_ms": 3491.417923,
+      "reference_samples_ms": [
+        3507.461969,
+        3482.599025,
+        3491.417923
+      ],
+      "speedup": 5.714680772260913,
+      "seed": 303,
+      "guards_intact": true
+    },
+    {
+      "case_id": 3,
+      "name": "random-sparse",
+      "status": "PASS",
+      "correct": true,
+      "time_ms": 757.862291,
+      "samples_ms": [
+        770.393593,
+        757.862291,
+        755.785751
+      ],
+      "reference_ms": 7758.921822,
+      "reference_samples_ms": [
+        7733.639281,
+        7774.108361,
+        7758.921822
+      ],
+      "speedup": 10.237904582588607,
+      "seed": 404,
+      "guards_intact": true
+    },
+    {
+      "case_id": 4,
+      "name": "grid-dag",
+      "status": "PASS",
+      "correct": true,
+      "time_ms": 279.652552,
+      "samples_ms": [
+        268.067222,
+        287.19705,
+        279.652552
+      ],
+      "reference_ms": 404.432506,
+      "reference_samples_ms": [
+        440.447951,
+        400.062665,
+        404.432506
+      ],
+      "speedup": 1.446196371560378,
+      "seed": 505,
+      "guards_intact": true
+    },
+    {
+      "case_id": 5,
+      "name": "large-mixed",
+      "status": "PASS",
+      "correct": true,
+      "time_ms": 1996.221275,
+      "samples_ms": [
+        1982.05475,
+        1996.221275,
+        2000.200107
+      ],
+      "reference_ms": 23807.216082,
+      "reference_samples_ms": [
+        23813.06425,
+        23807.216082,
+        23802.913133
+      ],
+      "speedup": 11.926140844280901,
+      "seed": 606,
+      "guards_intact": true
+    }
+  ],
+  "overall": "PASS"
+}
