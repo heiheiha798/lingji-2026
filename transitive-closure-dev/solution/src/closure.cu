@@ -38,7 +38,7 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   }
   const std::size_t bytes = static_cast<std::size_t>(vertices) *
                             words_per_row * sizeof(std::uint64_t);
-  constexpr int kPivotBlock = 128;
+  constexpr int kPivotBlock = 256;
   const std::size_t pivot_bytes = static_cast<std::size_t>(kPivotBlock) *
                                   words_per_row * sizeof(std::uint64_t);
   DeviceResources d;
@@ -46,7 +46,7 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
       !CudaOk(cudaMalloc(&d.reachability, bytes)) ||
       !CudaOk(cudaMalloc(&d.pivot_rows, pivot_bytes)) ||
       !CudaOk(cudaMalloc(&d.pivot_masks,
-                         (2 * kPivotBlock + 1) *
+                         (4 * kPivotBlock + 1) *
                              sizeof(std::uint64_t)))) {
     return 2;
   }
@@ -73,8 +73,9 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   if (!CudaOk(cudaGetLastError())) {
     return 2;
   }
+  const int pivot_stride = words_per_row <= 512 ? kPivotBlock : 128;
   for (int block_start = 0; block_start < vertices;
-       block_start += kPivotBlock) {
+       block_start += pivot_stride) {
     LaunchPivotBlock(d.reachability, d.pivot_rows, d.pivot_masks, vertices,
                      words_per_row, block_start, d.stream);
   }
