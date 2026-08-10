@@ -11,25 +11,33 @@
 namespace {
 
 constexpr int kDagBatchNeighborCapacity = 256;
+constexpr int kDagCpuValidationRows = 1024;
 
-__global__ void AnalyzeUpperTriangularDag(std::uint64_t *reach,
-                                          std::uint64_t *descriptors,
-                                          int vertices, int words) {
+__global__ void AnalyzeDagCandidate(std::uint64_t *reach,
+                                    std::uint64_t *descriptors, int vertices,
+                                    int words) {
   __shared__ int warp_degrees[8];
   __shared__ int warp_minimum_targets[8];
+  __shared__ int warp_invalid[8];
   const int row = blockIdx.x;
   const int diagonal_word = row / 64;
   const int diagonal_bit = row & 63;
   const std::size_t base = static_cast<std::size_t>(row) * words;
   int degree = 0;
   int minimum_target = vertices;
-  for (int word = diagonal_word + threadIdx.x; word < words;
-       word += blockDim.x) {
-    std::uint64_t remaining = reach[base + word];
-    if (word == diagonal_word) {
+  int invalid = 0;
+  for (int word = threadIdx.x; word < words; word += blockDim.x) {
+    const std::uint64_t value = reach[base + word];
+    std::uint64_t remaining = value;
+    if (word < diagonal_word) {
+      invalid |= value != 0;
+      remaining = 0;
+    } else if (word == diagonal_word) {
+      if (diagonal_bit != 0)
+        invalid |= (value & ((1ULL << diagonal_bit) - 1ULL)) != 0;
       remaining = diagonal_bit == 63
                       ? 0
-                      : remaining &
+                      : value &
                             ~((1ULL << (diagonal_bit + 1)) - 1ULL);
     }
     if (word == words - 1 && (vertices & 63) != 0)
@@ -42,6 +50,7 @@ __global__ void AnalyzeUpperTriangularDag(std::uint64_t *reach,
   }
   for (int offset = 16; offset > 0; offset /= 2) {
     degree += __shfl_down_sync(0xffffffffU, degree, offset);
+    invalid |= __shfl_down_sync(0xffffffffU, invalid, offset);
     minimum_target =
         min(minimum_target,
             __shfl_down_sync(0xffffffffU, minimum_target, offset));
@@ -51,21 +60,27 @@ __global__ void AnalyzeUpperTriangularDag(std::uint64_t *reach,
   if (lane == 0) {
     warp_degrees[warp] = degree;
     warp_minimum_targets[warp] = minimum_target;
+    warp_invalid[warp] = invalid;
   }
   __syncthreads();
   if (warp == 0) {
     degree = lane < 8 ? warp_degrees[lane] : 0;
     minimum_target =
         lane < 8 ? warp_minimum_targets[lane] : vertices;
+    invalid = lane < 8 ? warp_invalid[lane] : 0;
     for (int offset = 16; offset > 0; offset /= 2) {
       degree += __shfl_down_sync(0xffffffffU, degree, offset);
+      invalid |= __shfl_down_sync(0xffffffffU, invalid, offset);
       minimum_target =
           min(minimum_target,
               __shfl_down_sync(0xffffffffU, minimum_target, offset));
     }
     if (lane == 0) {
       descriptors[row] =
-          (static_cast<std::uint64_t>(degree) << 32) |
+          (static_cast<std::uint64_t>(
+               static_cast<std::uint32_t>(degree) |
+               (invalid != 0 ? 0x80000000U : 0U))
+           << 32) |
           static_cast<std::uint32_t>(minimum_target);
       reach[base + diagonal_word] |= 1ULL << diagonal_bit;
       if ((vertices & 63) != 0)
@@ -185,7 +200,9 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
     }
   }
   bool use_dag_closure = adjacent_successors < vertices / 2;
-  for (int row = 1; row < vertices && use_dag_closure; ++row) {
+  for (int row = 1;
+       row < vertices && row < kDagCpuValidationRows && use_dag_closure;
+       ++row) {
     const std::size_t base = static_cast<std::size_t>(row) * words_per_row;
     const int diagonal_word = row / 64;
     for (int word = 0; word < diagonal_word; ++word) {
@@ -250,7 +267,7 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   }
   if (use_dag_closure) {
     std::vector<std::uint64_t> dag_descriptors(vertices);
-    AnalyzeUpperTriangularDag<<<vertices, 256, 0, d.stream>>>(
+    AnalyzeDagCandidate<<<vertices, 256, 0, d.stream>>>(
         d.reachability, d.pivot_rows, vertices, words_per_row);
     if (!CudaOk(cudaGetLastError()) ||
         !CudaOk(cudaMemcpyAsync(dag_descriptors.data(), d.pivot_rows,
@@ -262,10 +279,17 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
     }
     int maximum_degree = 0;
     for (const std::uint64_t descriptor : dag_descriptors) {
-      const int degree = static_cast<int>(descriptor >> 32);
+      const std::uint32_t summary =
+          static_cast<std::uint32_t>(descriptor >> 32);
+      if ((summary & 0x80000000U) != 0) {
+        use_dag_closure = false;
+        break;
+      }
+      const int degree = static_cast<int>(summary);
       if (degree > maximum_degree) maximum_degree = degree;
     }
-    if (maximum_degree <= kDagBatchNeighborCapacity) {
+    if (use_dag_closure &&
+        maximum_degree <= kDagBatchNeighborCapacity) {
       int batch_end = vertices;
       while (batch_end > 0) {
         int batch_start = batch_end - 1;
