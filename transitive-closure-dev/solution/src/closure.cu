@@ -39,15 +39,32 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   const std::size_t bytes = static_cast<std::size_t>(vertices) *
                             words_per_row * sizeof(std::uint64_t);
   constexpr int kPivotBlock = 64;
+  const std::size_t pivot_bytes = static_cast<std::size_t>(kPivotBlock) *
+                                  words_per_row * sizeof(std::uint64_t);
   DeviceResources d;
   if (!CudaOk(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking)) ||
       !CudaOk(cudaMalloc(&d.reachability, bytes)) ||
-      !CudaOk(cudaMalloc(&d.pivot_rows,
-                         static_cast<std::size_t>(kPivotBlock) *
-                             words_per_row * sizeof(std::uint64_t))) ||
+      !CudaOk(cudaMalloc(&d.pivot_rows, pivot_bytes)) ||
       !CudaOk(cudaMalloc(&d.pivot_masks,
-                         kPivotBlock * sizeof(std::uint64_t))) ||
-      !CudaOk(cudaMemcpyAsync(d.reachability, adjacency, bytes,
+                         kPivotBlock * sizeof(std::uint64_t)))) {
+    return 2;
+  }
+  if (words_per_row <= 512) {
+    cudaStreamAttrValue stream_attribute{};
+    stream_attribute.accessPolicyWindow.base_ptr = d.pivot_rows;
+    stream_attribute.accessPolicyWindow.num_bytes = pivot_bytes;
+    stream_attribute.accessPolicyWindow.hitRatio = 1.0F;
+    stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    if (!CudaOk(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                                   pivot_bytes)) ||
+        !CudaOk(cudaStreamSetAttribute(
+            d.stream, cudaStreamAttributeAccessPolicyWindow,
+            &stream_attribute))) {
+      return 2;
+    }
+  }
+  if (!CudaOk(cudaMemcpyAsync(d.reachability, adjacency, bytes,
                               cudaMemcpyHostToDevice, d.stream))) {
     return 2;
   }
