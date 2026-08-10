@@ -7,6 +7,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -106,6 +108,7 @@ __global__ void AnalyzeDagCandidate(std::uint64_t *reach,
 
 __global__ void CloseOrderedDiagonalBlocks(std::uint64_t *reach,
                                            int *representatives,
+                                           int *fully_connected_blocks,
                                            int vertices, int words) {
   __shared__ std::uint64_t current_pivot;
   __shared__ std::uint64_t closed_masks[kOrderedBlockSize];
@@ -130,6 +133,14 @@ __global__ void CloseOrderedDiagonalBlocks(std::uint64_t *reach,
   }
   closed_masks[row] = row_mask;
   __syncthreads();
+  if (row == 0) {
+    bool fully_connected = block_size == kOrderedBlockSize;
+    for (int candidate = 0;
+         candidate < kOrderedBlockSize && fully_connected; ++candidate) {
+      fully_connected = closed_masks[candidate] == ~0ULL;
+    }
+    fully_connected_blocks[blockIdx.x] = fully_connected;
+  }
   if (row < block_size) {
     int representative = row;
     for (int candidate = 0; candidate < row; ++candidate) {
@@ -221,8 +232,8 @@ __global__ void CopyOrderedBlockRows(std::uint64_t *reach,
 __global__ void CloseOrderedBlocksCooperative(
     std::uint64_t *reach, std::uint64_t *block_rows,
     const int *representatives, int *global_neighbor_counts,
-    int *global_neighbors, int *fully_connected_flag, int vertices, int words,
-    int neighbor_capacity) {
+    int *global_neighbors, const int *fully_connected_blocks, int vertices,
+    int words, int neighbor_capacity, int materialize_complete_blocks) {
   __shared__ int neighbor_count;
   __shared__ int direct_neighbors[kOrderedBlockMaximumDegree];
   const cooperative_groups::grid_group grid = cooperative_groups::this_grid();
@@ -231,15 +242,6 @@ __global__ void CloseOrderedBlocksCooperative(
   const int word_tiles = gridDim.y;
   int block_start =
       ((vertices - 1) / kOrderedBlockSize) * kOrderedBlockSize;
-  if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-    bool fully_connected = vertices - block_start == kOrderedBlockSize;
-    for (int row = 0; row < kOrderedBlockSize && fully_connected; ++row) {
-      fully_connected =
-          representatives[block_start + row] == block_start;
-    }
-    *fully_connected_flag = fully_connected;
-  }
-  grid.sync();
   for (;
        block_start >= 0; block_start -= kOrderedBlockSize) {
     const int block_size =
@@ -248,7 +250,7 @@ __global__ void CloseOrderedBlocksCooperative(
     const int row = block_start + row_offset;
     const bool representative =
         active && representatives[row] == row;
-    if (*fully_connected_flag != 0) {
+    if (fully_connected_blocks[block_start / kOrderedBlockSize] != 0) {
       if (threadIdx.x == 0) neighbor_count = 0;
       __syncthreads();
       const std::size_t base = static_cast<std::size_t>(row) * words;
@@ -366,21 +368,15 @@ __global__ void CloseOrderedBlocksCooperative(
         }
       }
     }
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-      const int next_block_start = block_start - kOrderedBlockSize;
-      bool fully_connected = next_block_start >= 0;
-      for (int next_row = 0;
-           next_row < kOrderedBlockSize && fully_connected; ++next_row) {
-        fully_connected =
-            representatives[next_block_start + next_row] == next_block_start;
-      }
-      *fully_connected_flag = fully_connected;
-    }
     grid.sync();
   }
   for (int row = row_offset; row < vertices; row += kOrderedBlockSize) {
     const int representative = representatives[row];
-    if (representative == row) continue;
+    if (representative == row ||
+        (materialize_complete_blocks == 0 &&
+         fully_connected_blocks[row / kOrderedBlockSize] != 0)) {
+      continue;
+    }
     for (int word = word_tile * blockDim.x + threadIdx.x; word < words;
          word += word_tiles * blockDim.x) {
       reach[static_cast<std::size_t>(row) * words + word] =
@@ -570,7 +566,9 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   bool use_cooperative_dag_batches = false;
   bool use_ordered_block_closure = false;
   bool use_cooperative_ordered_blocks = false;
+  bool use_compressed_ordered_output = false;
   int maximum_dag_batch_size = 0;
+  std::vector<int> ordered_fully_connected_blocks;
   constexpr int kPivotBlock = 256;
   const std::size_t pivot_bytes = static_cast<std::size_t>(kPivotBlock) *
                                   words_per_row * sizeof(std::uint64_t);
@@ -578,6 +576,8 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
       vertices < kOrderedBlockNeighborCapacity
           ? vertices
           : kOrderedBlockNeighborCapacity;
+  const int ordered_block_count =
+      (vertices + kOrderedBlockSize - 1) / kOrderedBlockSize;
   const std::size_t ordered_scratch_bytes =
       static_cast<std::size_t>(vertices) * sizeof(int) +
       static_cast<std::size_t>(kOrderedBlockSize) * words_per_row *
@@ -585,7 +585,7 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
       static_cast<std::size_t>(kOrderedBlockSize) * sizeof(int) +
       static_cast<std::size_t>(kOrderedBlockSize) *
           ordered_neighbor_capacity * sizeof(int) +
-      2 * sizeof(int);
+      static_cast<std::size_t>(ordered_block_count + 2) * sizeof(int);
   const std::size_t pivot_allocation_bytes =
       ordered_block_candidate && ordered_scratch_bytes > pivot_bytes
           ? ordered_scratch_bytes
@@ -775,30 +775,54 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
         block_rows +
         static_cast<std::size_t>(kOrderedBlockSize) * words_per_row);
     int *global_neighbors = global_neighbor_counts + kOrderedBlockSize;
-    int *fully_connected_flag =
+    int *fully_connected_blocks =
         global_neighbors +
         static_cast<std::size_t>(kOrderedBlockSize) *
             ordered_neighbor_capacity;
     CloseOrderedDiagonalBlocks<<<
         (vertices + kOrderedBlockSize - 1) / kOrderedBlockSize,
         kOrderedBlockSize, 0, d.stream>>>(
-        d.reachability, representatives, vertices, words_per_row);
+        d.reachability, representatives, fully_connected_blocks, vertices,
+        words_per_row);
     if (use_cooperative_ordered_blocks) {
+      int materialize_complete_blocks = 1;
+      if (bytes >= 128ULL * 1024 * 1024 &&
+          vertices % kOrderedBlockSize == 0) {
+        ordered_fully_connected_blocks.resize(ordered_block_count);
+        if (!CudaOk(cudaMemcpyAsync(
+                ordered_fully_connected_blocks.data(),
+                fully_connected_blocks,
+                static_cast<std::size_t>(ordered_block_count) * sizeof(int),
+                cudaMemcpyDeviceToHost, d.stream)) ||
+            !CudaOk(cudaStreamSynchronize(d.stream))) {
+          return 2;
+        }
+        int fully_connected_count = 0;
+        for (const int fully_connected :
+             ordered_fully_connected_blocks) {
+          fully_connected_count += fully_connected != 0;
+        }
+        use_compressed_ordered_output =
+            fully_connected_count * 4 >= ordered_block_count;
+        materialize_complete_blocks =
+            use_compressed_ordered_output ? 0 : 1;
+      }
       std::uint64_t *reach_argument = d.reachability;
       std::uint64_t *block_rows_argument = block_rows;
       const int *representatives_argument = representatives;
       int *neighbor_counts_argument = global_neighbor_counts;
       int *neighbors_argument = global_neighbors;
-      int *fully_connected_flag_argument = fully_connected_flag;
+      const int *fully_connected_blocks_argument = fully_connected_blocks;
       int vertices_argument = vertices;
       int words_argument = words_per_row;
       int neighbor_capacity_argument = ordered_neighbor_capacity;
+      int materialize_argument = materialize_complete_blocks;
       void *arguments[] = {
           &reach_argument,          &block_rows_argument,
           &representatives_argument, &neighbor_counts_argument,
-          &neighbors_argument,      &fully_connected_flag_argument,
+          &neighbors_argument,      &fully_connected_blocks_argument,
           &vertices_argument,       &words_argument,
-          &neighbor_capacity_argument};
+          &neighbor_capacity_argument, &materialize_argument};
       if (!CudaOk(cudaLaunchCooperativeKernel(
               CloseOrderedBlocksCooperative,
               dim3(kOrderedBlockSize, (words_per_row + 255) / 256),
@@ -833,10 +857,78 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
                        words_per_row, block_start, d.stream);
     }
   }
-  if (!CudaOk(cudaGetLastError()) ||
-      !CudaOk(cudaMemcpyAsync(reachability, d.reachability, bytes,
-                              cudaMemcpyDeviceToHost, d.stream)) ||
-      !CudaOk(cudaStreamSynchronize(d.stream))) {
+  if (!CudaOk(cudaGetLastError())) {
+    return 2;
+  }
+  if (use_compressed_ordered_output) {
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(words_per_row) * sizeof(std::uint64_t);
+    if (!CudaOk(cudaMemcpy2DAsync(
+            reachability, kOrderedBlockSize * row_bytes, d.reachability,
+            kOrderedBlockSize * row_bytes, row_bytes, ordered_block_count,
+            cudaMemcpyDeviceToHost, d.stream))) {
+      return 2;
+    }
+    int block = 0;
+    while (block < ordered_block_count) {
+      if (ordered_fully_connected_blocks[block] != 0) {
+        ++block;
+        continue;
+      }
+      const int run_start = block;
+      while (block < ordered_block_count &&
+             ordered_fully_connected_blocks[block] == 0) {
+        ++block;
+      }
+      const int first_row = run_start * kOrderedBlockSize;
+      const std::size_t run_bytes =
+          static_cast<std::size_t>(block - run_start) * kOrderedBlockSize *
+          row_bytes;
+      if (!CudaOk(cudaMemcpyAsync(
+              reachability +
+                  static_cast<std::size_t>(first_row) * words_per_row,
+              d.reachability +
+                  static_cast<std::size_t>(first_row) * words_per_row,
+              run_bytes, cudaMemcpyDeviceToHost, d.stream))) {
+        return 2;
+      }
+    }
+    if (!CudaOk(cudaStreamSynchronize(d.stream))) {
+      return 2;
+    }
+    constexpr int kHostMaterializationThreads = 8;
+    std::vector<std::thread> materialization_threads;
+    materialization_threads.reserve(kHostMaterializationThreads);
+    for (int worker = 0; worker < kHostMaterializationThreads; ++worker) {
+      materialization_threads.emplace_back([&, worker] {
+        for (int complete_block = worker;
+             complete_block < ordered_block_count;
+             complete_block += kHostMaterializationThreads) {
+          if (ordered_fully_connected_blocks[complete_block] == 0) continue;
+          const std::size_t representative_row =
+              static_cast<std::size_t>(complete_block) * kOrderedBlockSize;
+          int materialized_rows = 1;
+          while (materialized_rows < kOrderedBlockSize) {
+            const int copied_rows =
+                materialized_rows < kOrderedBlockSize - materialized_rows
+                    ? materialized_rows
+                    : kOrderedBlockSize - materialized_rows;
+            std::memcpy(
+                reachability +
+                    (representative_row + materialized_rows) * words_per_row,
+                reachability + representative_row * words_per_row,
+                static_cast<std::size_t>(copied_rows) * row_bytes);
+            materialized_rows += copied_rows;
+          }
+        }
+      });
+    }
+    for (std::thread &materialization_thread : materialization_threads) {
+      materialization_thread.join();
+    }
+  } else if (!CudaOk(cudaMemcpyAsync(reachability, d.reachability, bytes,
+                                     cudaMemcpyDeviceToHost, d.stream)) ||
+             !CudaOk(cudaStreamSynchronize(d.stream))) {
     return 2;
   }
   return 0;
