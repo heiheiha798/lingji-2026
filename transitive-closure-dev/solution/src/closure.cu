@@ -6,8 +6,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace {
+
+constexpr int kDagBatchNeighborCapacity = 256;
 
 __global__ void CloseUpperTriangularDag(std::uint64_t *reach,
                                         int *neighbors, int vertices,
@@ -38,6 +41,38 @@ __global__ void CloseUpperTriangularDag(std::uint64_t *reach,
       reach[base + word] = output;
     }
     __syncthreads();
+  }
+}
+
+__global__ void CloseUpperTriangularDagBatch(std::uint64_t *reach,
+                                             int batch_start, int vertices,
+                                             int words) {
+  __shared__ int neighbor_count;
+  __shared__ int neighbors[kDagBatchNeighborCapacity];
+  const int row = batch_start + blockIdx.x;
+  if (row >= vertices) return;
+  if (threadIdx.x == 0) neighbor_count = 0;
+  __syncthreads();
+  const std::size_t base = static_cast<std::size_t>(row) * words;
+  for (int word = threadIdx.x; word < words; word += blockDim.x) {
+    std::uint64_t remaining = reach[base + word];
+    if (word == row / 64) remaining &= ~(1ULL << (row & 63));
+    while (remaining != 0) {
+      const int bit = __ffsll(static_cast<long long>(remaining)) - 1;
+      const int position = atomicAdd(&neighbor_count, 1);
+      neighbors[position] = word * 64 + bit;
+      remaining &= remaining - 1;
+    }
+  }
+  __syncthreads();
+  const int count = neighbor_count;
+  for (int word = threadIdx.x; word < words; word += blockDim.x) {
+    std::uint64_t output = reach[base + word];
+    for (int index = 0; index < count; ++index) {
+      output |= reach[static_cast<std::size_t>(neighbors[index]) * words +
+                      word];
+    }
+    reach[base + word] = output;
   }
 }
 
@@ -104,6 +139,47 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
       use_dag_closure = false;
     }
   }
+  std::vector<int> dag_batch_starts;
+  bool use_parallel_dag_batches = false;
+  if (use_dag_closure) {
+    std::vector<int> minimum_targets(vertices, vertices);
+    int maximum_degree = 0;
+    for (int row = 0; row < vertices; ++row) {
+      const std::size_t base = static_cast<std::size_t>(row) * words_per_row;
+      int degree = 0;
+      for (int word = row / 64; word < words_per_row; ++word) {
+        std::uint64_t remaining = adjacency[base + word];
+        if (word == row / 64) {
+          const int diagonal_bit = row & 63;
+          remaining = diagonal_bit == 63
+                          ? 0
+                          : remaining &
+                                ~((1ULL << (diagonal_bit + 1)) - 1ULL);
+        }
+        if (word == words_per_row - 1 && (vertices & 63) != 0)
+          remaining &= (1ULL << (vertices & 63)) - 1ULL;
+        if (remaining != 0 && minimum_targets[row] == vertices) {
+          minimum_targets[row] =
+              word * 64 + __builtin_ctzll(remaining);
+        }
+        degree += __builtin_popcountll(remaining);
+      }
+      if (degree > maximum_degree) maximum_degree = degree;
+    }
+    if (maximum_degree <= kDagBatchNeighborCapacity) {
+      int batch_end = vertices;
+      while (batch_end > 0) {
+        int batch_start = batch_end - 1;
+        while (batch_start > 0 &&
+               minimum_targets[batch_start - 1] >= batch_end) {
+          --batch_start;
+        }
+        dag_batch_starts.push_back(batch_start);
+        batch_end = batch_start;
+      }
+      use_parallel_dag_batches = dag_batch_starts.size() <= 256;
+    }
+  }
   constexpr int kPivotBlock = 256;
   const std::size_t pivot_bytes = static_cast<std::size_t>(kPivotBlock) *
                                   words_per_row * sizeof(std::uint64_t);
@@ -154,9 +230,19 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
     return 2;
   }
   if (use_dag_closure) {
-    CloseUpperTriangularDag<<<1, 256, 0, d.stream>>>(
-        d.reachability, reinterpret_cast<int *>(d.pivot_rows), vertices,
-        words_per_row);
+    if (use_parallel_dag_batches) {
+      int batch_end = vertices;
+      for (const int batch_start : dag_batch_starts) {
+        CloseUpperTriangularDagBatch<<<batch_end - batch_start, 256, 0,
+                                       d.stream>>>(
+            d.reachability, batch_start, vertices, words_per_row);
+        batch_end = batch_start;
+      }
+    } else {
+      CloseUpperTriangularDag<<<1, 256, 0, d.stream>>>(
+          d.reachability, reinterpret_cast<int *>(d.pivot_rows), vertices,
+          words_per_row);
+    }
   } else {
     const int pivot_stride = words_per_row <= 512 ? kPivotBlock : 128;
     for (int block_start = 0; block_start < vertices;
