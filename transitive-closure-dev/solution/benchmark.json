@@ -1,58 +1,60 @@
 {
-  "generated_at_utc": "2026-08-10T03:02:11+00:00",
-  "solution_dir": "/data/home/tianjianyang/code/tmp/lingji-2026-agents/transitive-closure/transitive-closure-dev/solution",
+  "generated_at_utc": "2026-08-10T19:32:57+00:00",
+  "solution_dir": "/data/home/tianjianyang/code/tmp/lingji-2026-agents/gpu7-further-optimization-v2/transitive-closure-dev/solution",
   "command": [
     "/data/home/tianjianyang/miniconda3/bin/python3",
-    "run_judge.py",
+    "transitive-closure-dev/run_judge.py",
+    "--repeats",
+    "3",
     "--random-seed",
-    "987654321",
+    "8091548694775575726",
     "--json-output",
-    "solution/benchmark.json"
+    "transitive-closure-dev/solution/benchmark.json"
   ],
   "environment": {
     "platform": "Linux-6.14.0-27-generic-x86_64-with-glibc2.39",
     "python": "3.13.9",
-    "nvcc": "Build cuda_13.0.r13.0/compiler.36424714_0",
+    "nvcc": "Build cuda_12.8.r12.8/compiler.35404655_0",
     "gpu": "NVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB"
   },
   "functional": {
     "status": "PASS",
-    "seed": 987654321,
+    "seed": 8091548694775575726,
     "cases": [
       {
         "name": "random-layered-dag",
         "status": "PASS",
         "correct": true,
-        "vertices": 151,
-        "seed": 11400714818354943140
+        "vertices": 208,
+        "seed": 17185046869040285883
       },
       {
         "name": "random-block-scc",
         "status": "PASS",
         "correct": true,
-        "vertices": 125,
-        "seed": 4354685563958890651
+        "vertices": 218,
+        "seed": 5486518871350004868
       },
       {
         "name": "random-sparse",
         "status": "PASS",
         "correct": true,
-        "vertices": 102,
-        "seed": 15755400383339502734
+        "vertices": 112,
+        "seed": 12316387884960628881
       },
       {
         "name": "random-grid-dag",
         "status": "PASS",
         "correct": true,
-        "vertices": 99,
-        "seed": 8709371128981199077
+        "vertices": 256,
+        "seed": 618983605371553018
       },
       {
         "name": "random-mixed",
         "status": "PASS",
         "correct": true,
-        "vertices": 123,
-        "seed": 1663341874584880344
+        "vertices": 145,
+        "seed": 7448835267247200455
       }
     ]
   },
@@ -62,19 +64,19 @@
       "name": "tiny-correctness",
       "status": "PASS",
       "correct": true,
-      "time_ms": 235.166518,
+      "time_ms": 247.235436,
       "samples_ms": [
-        236.480746,
-        234.270324,
-        235.166518
+        247.235436,
+        236.664925,
+        252.096901
       ],
-      "reference_ms": 239.609522,
+      "reference_ms": 245.574262,
       "reference_samples_ms": [
-        240.1047,
-        236.705039,
-        239.609522
+        248.914045,
+        243.065079,
+        245.574262
       ],
-      "speedup": 1.0188930126524218,
+      "speedup": 0.9932810036179442,
       "seed": 101,
       "guards_intact": true
     },
@@ -83,19 +85,19 @@
       "name": "layered-dag",
       "status": "PASS",
       "correct": true,
-      "time_ms": 289.296031,
+      "time_ms": 242.35348,
       "samples_ms": [
-        281.400783,
-        289.296031,
-        299.447991
+        242.986659,
+        242.35348,
+        239.771896
       ],
-      "reference_ms": 436.76729,
+      "reference_ms": 451.247124,
       "reference_samples_ms": [
-        466.022218,
-        436.74472,
-        436.76729
+        462.439187,
+        436.546151,
+        451.247124
       ],
-      "speedup": 1.5097590122140319,
+      "speedup": 1.861937876856565,
       "seed": 202,
       "guards_intact": true
     },
@@ -104,19 +106,19 @@
       "name": "block-scc",
       "status": "PASS",
       "correct": true,
-      "time_ms": 610.955898,
+      "time_ms": 279.656232,
       "samples_ms": [
-        627.241266,
-        605.082146,
-        610.955898
+        279.656232,
+        275.553037,
+        301.839606
       ],
-      "reference_ms": 3491.417923,
+      "reference_ms": 3492.270219,
       "reference_samples_ms": [
-        3507.461969,
-        3482.599025,
-        3491.417923
+        3493.898892,
+        3492.270219,
+        3481.161012
       ],
-      "speedup": 5.714680772260913,
+      "speedup": 12.487725354892145,
       "seed": 303,
       "guards_intact": true
     },
@@ -125,19 +127,19 @@
       "name": "random-sparse",
       "status": "PASS",
       "correct": true,
-      "time_ms": 757.862291,
+      "time_ms": 310.641467,
       "samples_ms": [
-        770.393593,
-        757.862291,
-        755.785751
+        310.641467,
+        306.523556,
+        316.683686
       ],
-      "reference_ms": 7758.921822,
+      "reference_ms": 7765.51584,
       "reference_samples_ms": [
-        7733.639281,
-        7774.108361,
-        7758.921822
+        7773.709452,
+        7765.51584,
+        7746.503823
       ],
-      "speedup": 10.237904582588607,
+      "speedup": 24.998323356488658,
       "seed": 404,
       "guards_intact": true
     },
@@ -146,19 +148,19 @@
       "name": "grid-dag",
       "status": "PASS",
       "correct": true,
-      "time_ms": 279.652552,
+      "time_ms": 253.663666,
       "samples_ms": [
-        268.067222,
-        287.19705,
-        279.652552
+        285.853424,
+        248.425369,
+        253.663666
       ],
-      "reference_ms": 404.432506,
+      "reference_ms": 409.912463,
       "reference_samples_ms": [
-        440.447951,
-        400.062665,
-        404.432506
+        420.177989,
+        409.912463,
+        400.23746
       ],
-      "speedup": 1.446196371560378,
+      "speedup": 1.615968378380213,
       "seed": 505,
       "guards_intact": true
     },
@@ -167,19 +169,19 @@
       "name": "large-mixed",
       "status": "PASS",
       "correct": true,
-      "time_ms": 1996.221275,
+      "time_ms": 423.219152,
       "samples_ms": [
-        1982.05475,
-        1996.221275,
-        2000.200107
+        445.168382,
+        423.219152,
+        413.977876
       ],
-      "reference_ms": 23807.216082,
+      "reference_ms": 23823.682155,
       "reference_samples_ms": [
-        23813.06425,
-        23807.216082,
-        23802.913133
+        23837.602528,
+        23816.846026,
+        23823.682155
       ],
-      "speedup": 11.926140844280901,
+      "speedup": 56.2915974913158,
       "seed": 606,
       "guards_intact": true
     }
