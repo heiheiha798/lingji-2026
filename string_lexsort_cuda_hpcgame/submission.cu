@@ -373,12 +373,17 @@ void lexsort_cuda(
     sort_tiles<16><<<blocks, kThreads, 0, capture_stream>>>(
         input_strings, output, n);
   } else if (width == 32) {
-    sort_tiles<32, true><<<
-        blocks,
-        kThreads,
-        (32 / 4 - 1) * kThreads * sizeof(uint32_t),
-        capture_stream>>>(
-        input_strings, output, n);
+    if (n == 65536) {
+      sort_tiles<32, true><<<
+          blocks,
+          kThreads,
+          (32 / 4 - 1) * kThreads * sizeof(uint32_t),
+          capture_stream>>>(
+          input_strings, output, n);
+    } else {
+      sort_tiles<32><<<blocks, kThreads, 0, capture_stream>>>(
+          input_strings, output, n);
+    }
   } else {
     TORCH_CHECK(width == 64, "unsupported string width: ", width);
     sort_tiles<64><<<blocks, kThreads, 0, capture_stream>>>(
