@@ -13,7 +13,7 @@ namespace {
 
 constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr int kThreads = 256;
-constexpr std::uint32_t kImplementationId = 1;
+constexpr std::uint32_t kImplementationId = 3;
 
 __device__ __constant__ std::int8_t g_triangle_table[256][16];
 __device__ __constant__ std::uint8_t g_triangle_count[256];
@@ -89,8 +89,9 @@ __global__ void store_workspace_descriptor(
 __global__ void classify_cells(const float* __restrict__ volume, int nx,
                                int ny, int cx, int cy,
                                std::uint32_t num_cells,
-                               const float* __restrict__ isovalues, int iso,
-                               std::uint32_t* __restrict__ counts) {
+                               const float* __restrict__ isovalues,
+                               int num_isovalues,
+                               std::uint8_t* __restrict__ counts) {
   const std::uint32_t cell_id = blockIdx.x * blockDim.x + threadIdx.x;
   if (cell_id >= num_cells) {
     return;
@@ -101,12 +102,15 @@ __global__ void classify_cells(const float* __restrict__ volume, int nx,
   icecarver::mc::decode_cell(cell_id, cx, cy, x, y, z);
   float values[8];
   icecarver::mc::load_corners(volume, nx, ny, x, y, z, values);
-  const std::uint8_t cube_case =
-      icecarver::mc::case_index(values, isovalues[iso]);
-  counts[cell_id] = g_triangle_count[cube_case];
+  for (int iso = 0; iso < num_isovalues; ++iso) {
+    const std::uint8_t cube_case =
+        icecarver::mc::case_index(values, isovalues[iso]);
+    counts[static_cast<std::size_t>(iso) * num_cells + cell_id] =
+        g_triangle_count[cube_case];
+  }
 }
 
-__global__ void publish_total(const std::uint32_t* __restrict__ counts,
+__global__ void publish_total(const std::uint8_t* __restrict__ counts,
                               const std::uint32_t* __restrict__ offsets,
                               std::uint32_t num_cells,
                               std::uint64_t* __restrict__ totals, int iso) {
@@ -119,7 +123,7 @@ __global__ void publish_total(const std::uint32_t* __restrict__ counts,
 __global__ void generate_triangles(
     const float* __restrict__ volume, int nx, int ny, int cx, int cy,
     std::uint32_t num_cells, const float* __restrict__ isovalues, int iso,
-    const std::uint32_t* __restrict__ counts,
+    const std::uint8_t* __restrict__ counts,
     const std::uint32_t* __restrict__ offsets,
     icecarver::Triangle* __restrict__ triangles, std::uint64_t capacity) {
   const std::uint32_t cell_id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -163,7 +167,7 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
 
   std::size_t scan_temp_bytes = 0;
   cudaError_t status = cub::DeviceScan::ExclusiveSum(
-      nullptr, scan_temp_bytes, static_cast<const std::uint32_t*>(nullptr),
+      nullptr, scan_temp_bytes, static_cast<const std::uint8_t*>(nullptr),
       static_cast<std::uint32_t*>(nullptr), static_cast<int>(num_cells),
       stream);
   if (status != cudaSuccess) {
@@ -173,7 +177,8 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   std::size_t counts_bytes = 0;
   std::size_t offsets_bytes = 0;
   if (!checked_multiply(static_cast<std::size_t>(num_cells),
-                        sizeof(std::uint32_t), &counts_bytes) ||
+                        static_cast<std::size_t>(input->num_isovalues),
+                        &counts_bytes) ||
       !checked_multiply(static_cast<std::size_t>(num_cells),
                         sizeof(std::uint32_t), &offsets_bytes)) {
     return icecarver::kSizeOverflow;
@@ -201,7 +206,7 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   }
 
   auto* bytes = static_cast<unsigned char*>(workspace);
-  auto* counts = reinterpret_cast<std::uint32_t*>(bytes + counts_offset);
+  auto* counts = reinterpret_cast<std::uint8_t*>(bytes + counts_offset);
   auto* offsets = reinterpret_cast<std::uint32_t*>(bytes + offsets_offset);
   void* scan_temp = bytes + scan_temp_offset;
 
@@ -236,16 +241,19 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   const unsigned int blocks =
       (num_cells + static_cast<std::uint32_t>(kThreads) - 1U) /
       static_cast<std::uint32_t>(kThreads);
+  classify_cells<<<blocks, kThreads, 0, stream>>>(
+      input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
+      num_cells, input->isovalues, input->num_isovalues, counts);
+  ICECARVER_RETURN_IF_LAUNCH_ERROR();
+
   for (int iso = 0; iso < input->num_isovalues; ++iso) {
-    classify_cells<<<blocks, kThreads, 0, stream>>>(
-        input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
-        num_cells, input->isovalues, iso, counts);
-    ICECARVER_RETURN_IF_LAUNCH_ERROR();
+    const std::uint8_t* iso_counts =
+        counts + static_cast<std::size_t>(iso) * num_cells;
 
     ICECARVER_RETURN_IF_CUDA_ERROR(cub::DeviceScan::ExclusiveSum(
-        scan_temp, scan_temp_bytes, counts, offsets,
+        scan_temp, scan_temp_bytes, iso_counts, offsets,
         static_cast<int>(num_cells), stream));
-    publish_total<<<1, 1, 0, stream>>>(counts, offsets, num_cells,
+    publish_total<<<1, 1, 0, stream>>>(iso_counts, offsets, num_cells,
                                       output->triangle_counts, iso);
     ICECARVER_RETURN_IF_LAUNCH_ERROR();
 
@@ -260,7 +268,7 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
       }
       generate_triangles<<<blocks, kThreads, 0, stream>>>(
           input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
-          num_cells, input->isovalues, iso, counts, offsets,
+          num_cells, input->isovalues, iso, iso_counts, offsets,
           output->triangles[iso], output->capacities[iso]);
       ICECARVER_RETURN_IF_LAUNCH_ERROR();
     }
