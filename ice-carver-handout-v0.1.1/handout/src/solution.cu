@@ -16,7 +16,7 @@ constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr int kThreads = 256;
 constexpr int kRowThreads = 64;
 constexpr int kEmitWarps = 2;
-constexpr std::uint32_t kImplementationId = 12;
+constexpr std::uint32_t kImplementationId = 13;
 
 __device__ __constant__ std::int8_t g_triangle_table[256][16];
 __device__ __constant__ std::uint8_t g_triangle_count[256];
@@ -113,24 +113,25 @@ __global__ void classify_cells(const float* __restrict__ volume, int nx,
   }
 }
 
+template <int NumIsovalues>
 __global__ void classify_cells_by_row(
     const float* __restrict__ volume, int nx, int ny, int cx, int cy,
     std::uint32_t num_cells, const float* __restrict__ isovalues,
     std::uint8_t* __restrict__ counts,
     std::uint32_t* __restrict__ row_counts) {
-  __shared__ std::uint32_t warp_totals[2][icecarver::kMaxIsovalues];
+  __shared__ std::uint32_t warp_totals[2][NumIsovalues];
 
   const std::uint32_t row_id = blockIdx.x;
   const int y = static_cast<int>(row_id % static_cast<std::uint32_t>(cy));
   const int z = static_cast<int>(row_id / static_cast<std::uint32_t>(cy));
-  std::uint32_t thread_totals[icecarver::kMaxIsovalues]{};
+  std::uint32_t thread_totals[NumIsovalues]{};
   for (int x = threadIdx.x; x < cx; x += blockDim.x) {
     const std::uint32_t cell_id = row_id * static_cast<std::uint32_t>(cx) +
                                   static_cast<std::uint32_t>(x);
     float values[8];
     icecarver::mc::load_corners(volume, nx, ny, x, y, z, values);
 #pragma unroll
-    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+    for (int iso = 0; iso < NumIsovalues; ++iso) {
       const std::uint8_t cube_case =
           icecarver::mc::case_index(values, isovalues[iso]);
       const std::uint8_t count = g_triangle_count[cube_case];
@@ -142,7 +143,7 @@ __global__ void classify_cells_by_row(
 #pragma unroll
   for (int delta = 16; delta > 0; delta >>= 1) {
 #pragma unroll
-    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+    for (int iso = 0; iso < NumIsovalues; ++iso) {
       thread_totals[iso] +=
           __shfl_down_sync(0xffffffffU, thread_totals[iso], delta);
     }
@@ -151,12 +152,12 @@ __global__ void classify_cells_by_row(
   const int warp = threadIdx.x >> 5;
   if (lane == 0) {
 #pragma unroll
-    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+    for (int iso = 0; iso < NumIsovalues; ++iso) {
       warp_totals[warp][iso] = thread_totals[iso];
     }
   }
   __syncthreads();
-  if (threadIdx.x < icecarver::kMaxIsovalues) {
+  if (threadIdx.x < NumIsovalues) {
     const int iso = threadIdx.x;
     row_counts[static_cast<std::size_t>(iso) * gridDim.x + row_id] =
         warp_totals[0][iso] + warp_totals[1][iso];
@@ -219,14 +220,14 @@ __global__ void generate_triangles(
   }
 }
 
+template <int NumIsovalues>
 __global__ __launch_bounds__(kRowThreads, 16) void generate_triangles_by_row(
     const float* __restrict__ volume, int nx, int ny, int cx, int cy,
     std::uint32_t num_rows, const float* __restrict__ isovalues,
     const std::uint8_t* __restrict__ counts,
     const std::uint32_t* __restrict__ row_offsets,
     icecarver::Output output) {
-  __shared__ std::uint32_t
-      warp_prefixes[kEmitWarps][icecarver::kMaxIsovalues];
+  __shared__ std::uint32_t warp_prefixes[kEmitWarps][NumIsovalues];
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -241,7 +242,7 @@ __global__ __launch_bounds__(kRowThreads, 16) void generate_triangles_by_row(
     y = static_cast<int>(row_id % static_cast<std::uint32_t>(cy));
     z = static_cast<int>(row_id / static_cast<std::uint32_t>(cy));
 #pragma unroll
-    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+    for (int iso = 0; iso < NumIsovalues; ++iso) {
       warp_prefixes[warp][iso] =
           row_offsets[static_cast<std::size_t>(iso) * num_rows + row_id];
       valid_isovalues |= static_cast<std::uint32_t>(
@@ -262,7 +263,7 @@ __global__ __launch_bounds__(kRowThreads, 16) void generate_triangles_by_row(
         static_cast<std::size_t>(x);
     std::uint64_t packed_counts = 0;
 #pragma unroll
-    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+    for (int iso = 0; iso < NumIsovalues; ++iso) {
       const std::uint64_t count =
           x < cx ? counts[static_cast<std::size_t>(iso) * num_cells + cell_id]
                  : 0;
@@ -298,7 +299,7 @@ __global__ __launch_bounds__(kRowThreads, 16) void generate_triangles_by_row(
     }
 
 #pragma unroll 1
-    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+    for (int iso = 0; iso < NumIsovalues; ++iso) {
       const std::uint32_t count =
           static_cast<std::uint32_t>((packed_counts >> (8 * iso)) & 0xffU);
       std::uint32_t inclusive = count;
@@ -447,6 +448,9 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   }
   const unsigned int rows =
       num_cells / static_cast<std::uint32_t>(input->nx - 1);
+  const bool use_row_path =
+      input->num_isovalues == 2 ||
+      input->num_isovalues == icecarver::kMaxIsovalues;
 
   std::size_t scan_temp_bytes = 0;
   cudaError_t status = cub::DeviceScan::ExclusiveSum(
@@ -456,7 +460,7 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   if (status != cudaSuccess) {
     return icecarver::kCudaFailure;
   }
-  if (input->num_isovalues == icecarver::kMaxIsovalues) {
+  if (use_row_path) {
     std::size_t row_scan_temp_bytes = 0;
     status = cub::DeviceScan::ExclusiveSum(
         nullptr, row_scan_temp_bytes,
@@ -473,11 +477,10 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   std::size_t counts_bytes = 0;
   std::size_t offsets_bytes = 0;
   std::size_t offset_entries = static_cast<std::size_t>(num_cells);
-  if (input->num_isovalues == icecarver::kMaxIsovalues &&
-      static_cast<std::size_t>(2 * icecarver::kMaxIsovalues) * rows >
-          offset_entries) {
-    offset_entries =
-        static_cast<std::size_t>(2 * icecarver::kMaxIsovalues) * rows;
+  const std::size_t row_offset_entries =
+      static_cast<std::size_t>(2 * input->num_isovalues) * rows;
+  if (use_row_path && row_offset_entries > offset_entries) {
+    offset_entries = row_offset_entries;
   }
   if (!checked_multiply(static_cast<std::size_t>(num_cells),
                         static_cast<std::size_t>(input->num_isovalues),
@@ -552,8 +555,13 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   const unsigned int blocks =
       (num_cells + static_cast<std::uint32_t>(kThreads) - 1U) /
       static_cast<std::uint32_t>(kThreads);
-  if (input->num_isovalues == icecarver::kMaxIsovalues) {
-    classify_cells_by_row<<<rows, kRowThreads, 0, stream>>>(
+  if (input->num_isovalues == 2) {
+    classify_cells_by_row<2><<<rows, kRowThreads, 0, stream>>>(
+        input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
+        num_cells, input->isovalues, counts, offsets);
+  } else if (input->num_isovalues == icecarver::kMaxIsovalues) {
+    classify_cells_by_row<icecarver::kMaxIsovalues>
+        <<<rows, kRowThreads, 0, stream>>>(
         input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
         num_cells, input->isovalues, counts, offsets);
   } else {
@@ -567,10 +575,10 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
     const std::uint8_t* iso_counts =
         counts + static_cast<std::size_t>(iso) * num_cells;
 
-    if (input->num_isovalues == icecarver::kMaxIsovalues) {
+    if (use_row_path) {
       auto* row_counts = offsets + static_cast<std::size_t>(iso) * rows;
       auto* row_offsets =
-          offsets + static_cast<std::size_t>(icecarver::kMaxIsovalues + iso) *
+          offsets + static_cast<std::size_t>(input->num_isovalues + iso) *
                         rows;
       ICECARVER_RETURN_IF_CUDA_ERROR(cub::DeviceScan::ExclusiveSum(
           scan_temp, scan_temp_bytes, row_counts, row_offsets,
@@ -596,16 +604,24 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
     }
   }
 
-  if (input->num_isovalues == icecarver::kMaxIsovalues &&
-      input->emit_triangles != 0) {
+  if (use_row_path && input->emit_triangles != 0) {
     const unsigned int row_blocks =
         (rows + static_cast<unsigned int>(kEmitWarps) - 1U) /
         static_cast<unsigned int>(kEmitWarps);
-    generate_triangles_by_row<<<row_blocks, kRowThreads, 0, stream>>>(
-        input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
-        rows, input->isovalues, counts,
-        offsets + static_cast<std::size_t>(icecarver::kMaxIsovalues) * rows,
-        *output);
+    if (input->num_isovalues == 2) {
+      generate_triangles_by_row<2><<<row_blocks, kRowThreads, 0, stream>>>(
+          input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
+          rows, input->isovalues, counts,
+          offsets + static_cast<std::size_t>(input->num_isovalues) * rows,
+          *output);
+    } else {
+      generate_triangles_by_row<icecarver::kMaxIsovalues>
+          <<<row_blocks, kRowThreads, 0, stream>>>(
+              input->volume, input->nx, input->ny, input->nx - 1,
+              input->ny - 1, rows, input->isovalues, counts,
+              offsets + static_cast<std::size_t>(input->num_isovalues) * rows,
+              *output);
+    }
     ICECARVER_RETURN_IF_LAUNCH_ERROR();
   }
 
