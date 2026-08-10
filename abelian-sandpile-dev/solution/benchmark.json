@@ -1,6 +1,6 @@
 {
-  "generated_at_utc": "2026-08-10T02:58:04+00:00",
-  "solution_dir": "/data/home/tianjianyang/code/tmp/lingji-2026-agents/abelian-sandpile/abelian-sandpile-dev/solution",
+  "generated_at_utc": "2026-08-10T06:42:16+00:00",
+  "solution_dir": "/data/home/tianjianyang/code/tmp/lingji-2026-agents/gpu7-further-optimization-v2/abelian-sandpile-dev/solution",
   "command": [
     "/data/home/tianjianyang/miniconda3/bin/python3",
     "run_judge.py",
@@ -10,12 +10,12 @@
     "184725193",
     "--no-build",
     "--json-output",
-    "solution/benchmark.json"
+    "/tmp/sandpile-gpu7-v2-final.json"
   ],
   "environment": {
     "platform": "Linux-6.14.0-27-generic-x86_64-with-glibc2.39",
     "python": "3.13.9",
-    "nvcc": "Build cuda_13.0.r13.0/compiler.36424714_0",
+    "nvcc": "Build cuda_12.8.r12.8/compiler.35404655_0",
     "gpu": "NVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB\nNVIDIA GeForce RTX 4090, 580.119.02, 24564 MiB"
   },
   "functional": {
@@ -70,15 +70,15 @@
       "name": "tiny-correctness",
       "status": "PASS",
       "correct": true,
-      "time_ms": 243.786387,
+      "time_ms": 301.493641,
       "samples_ms": [
-        243.786387
+        301.493641
       ],
-      "reference_ms": 242.431257,
+      "reference_ms": 294.015517,
       "reference_samples_ms": [
-        242.431257
+        294.015517
       ],
-      "speedup": 0.9944413221071281,
+      "speedup": 0.9751964121856884,
       "seed": 101,
       "guards_intact": true
     },
@@ -87,15 +87,15 @@
       "name": "global-rain",
       "status": "PASS",
       "correct": true,
-      "time_ms": 497.660851,
+      "time_ms": 340.994279,
       "samples_ms": [
-        497.660851
+        340.994279
       ],
-      "reference_ms": 726.820741,
+      "reference_ms": 742.004061,
       "reference_samples_ms": [
-        726.820741
+        742.004061
       ],
-      "speedup": 1.4604740146618445,
+      "speedup": 2.176001495321275,
       "seed": 202,
       "guards_intact": true
     },
@@ -104,15 +104,15 @@
       "name": "local-avalanche",
       "status": "PASS",
       "correct": true,
-      "time_ms": 7560.217611,
+      "time_ms": 1283.457478,
       "samples_ms": [
-        7560.217611
+        1283.457478
       ],
-      "reference_ms": 15127.139967,
+      "reference_ms": 15137.291188,
       "reference_samples_ms": [
-        15127.139967
+        15137.291188
       ],
-      "speedup": 2.0008868455043203,
+      "speedup": 11.794150914596953,
       "seed": 303,
       "guards_intact": true
     },
@@ -121,15 +121,15 @@
       "name": "many-sources",
       "status": "PASS",
       "correct": true,
-      "time_ms": 12037.070487,
+      "time_ms": 2988.100953,
       "samples_ms": [
-        12037.070487
+        2988.100953
       ],
-      "reference_ms": 24028.459711,
+      "reference_ms": 24052.77988,
       "reference_samples_ms": [
-        24028.459711
+        24052.77988
       ],
-      "speedup": 1.9962049517738276,
+      "speedup": 8.049520500922647,
       "seed": 404,
       "guards_intact": true
     },
@@ -138,15 +138,15 @@
       "name": "near-critical",
       "status": "PASS",
       "correct": true,
-      "time_ms": 13558.963583,
+      "time_ms": 4799.207231,
       "samples_ms": [
-        13558.963583
+        4799.207231
       ],
-      "reference_ms": 55667.162867,
+      "reference_ms": 55837.149894,
       "reference_samples_ms": [
-        55667.162867
+        55837.149894
       ],
-      "speedup": 4.1055617950618695,
+      "speedup": 11.634661144308481,
       "seed": 505,
       "guards_intact": true
     },
@@ -155,15 +155,15 @@
       "name": "large-mixed",
       "status": "PASS",
       "correct": true,
-      "time_ms": 47553.312141,
+      "time_ms": 12926.071637,
       "samples_ms": [
-        47553.312141
+        12926.071637
       ],
-      "reference_ms": 95092.805781,
+      "reference_ms": 95235.496662,
       "reference_samples_ms": [
-        95092.805781
+        95235.496662
       ],
-      "speedup": 1.9997094103359399,
+      "speedup": 7.367706085536064,
       "seed": 606,
       "guards_intact": true
     }
