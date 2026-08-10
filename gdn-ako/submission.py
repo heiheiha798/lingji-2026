@@ -21,12 +21,10 @@ autograd：评测会对 o 做 backward，梯度须回传到 q/k/v/beta。只优�
 
 
 def gdn_chunk_scan(q, k, v, g, beta, scale):
-    # 默认实现 = 直接调 fla（即基线）。请替换成你的 kernel。
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-    o, _ = chunk_gated_delta_rule(
-        q=q, k=k, v=v, g=g, beta=beta,
-        scale=scale, initial_state=None, output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        state_v_first=True,
+    from fla.ops.gated_delta_rule.chunk import ChunkGatedDeltaRuleFunction
+    o, _ = ChunkGatedDeltaRuleFunction.apply(
+        q, k, v, g, beta, scale,
+        None, False, True, None, None, True,
+        False, None, None, False, False, None,
     )
     return o
