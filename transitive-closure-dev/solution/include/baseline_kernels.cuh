@@ -7,6 +7,10 @@
 void LaunchInitialize(std::uint64_t *reachability, int vertices, int words,
                       cudaStream_t stream);
 
+void LaunchUpperTriangularClosure(std::uint64_t *reachability,
+                                  std::uint64_t *scratch, int vertices,
+                                  int words, cudaStream_t stream);
+
 void LaunchPivotBlock(std::uint64_t *reachability,
                       std::uint64_t *pivot_rows,
                       std::uint64_t *pivot_masks, int vertices, int words,

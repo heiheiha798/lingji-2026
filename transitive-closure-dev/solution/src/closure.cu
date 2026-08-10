@@ -46,6 +46,23 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   }
   const std::size_t bytes = static_cast<std::size_t>(vertices) *
                             words_per_row * sizeof(std::uint64_t);
+  bool upper_triangular = true;
+  for (int row = 1; row < vertices && upper_triangular; ++row) {
+    const std::size_t base = static_cast<std::size_t>(row) * words_per_row;
+    const int diagonal_word = row / 64;
+    for (int word = 0; word < diagonal_word; ++word) {
+      if (adjacency[base + word] != 0) {
+        upper_triangular = false;
+        break;
+      }
+    }
+    const int diagonal_bit = row & 63;
+    if (upper_triangular && diagonal_bit != 0 &&
+        (adjacency[base + diagonal_word] &
+         ((1ULL << diagonal_bit) - 1ULL)) != 0) {
+      upper_triangular = false;
+    }
+  }
   constexpr int kPivotBlock = 256;
   const std::size_t pivot_bytes = static_cast<std::size_t>(kPivotBlock) *
                                   words_per_row * sizeof(std::uint64_t);
@@ -95,11 +112,16 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   if (!CudaOk(cudaGetLastError())) {
     return 2;
   }
-  const int pivot_stride = words_per_row <= 512 ? kPivotBlock : 128;
-  for (int block_start = 0; block_start < vertices;
-       block_start += pivot_stride) {
-    LaunchPivotBlock(d.reachability, d.pivot_rows, d.pivot_masks, vertices,
-                     words_per_row, block_start, d.stream);
+  if (upper_triangular) {
+    LaunchUpperTriangularClosure(d.reachability, d.pivot_rows, vertices,
+                                 words_per_row, d.stream);
+  } else {
+    const int pivot_stride = words_per_row <= 512 ? kPivotBlock : 128;
+    for (int block_start = 0; block_start < vertices;
+         block_start += pivot_stride) {
+      LaunchPivotBlock(d.reachability, d.pivot_rows, d.pivot_masks, vertices,
+                       words_per_row, block_start, d.stream);
+    }
   }
   if (!CudaOk(cudaGetLastError()) ||
       !CudaOk(cudaMemcpyAsync(reachability, d.reachability, bytes,

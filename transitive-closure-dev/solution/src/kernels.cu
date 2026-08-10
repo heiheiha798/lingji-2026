@@ -22,6 +22,38 @@ __global__ void AddDiagonalAndMask(std::uint64_t *reach, int vertices,
         (1ULL << (vertices & 63)) - 1ULL;
 }
 
+__global__ void CloseUpperTriangularDag(std::uint64_t *reach,
+                                        int *neighbors, int vertices,
+                                        int words) {
+  __shared__ int neighbor_count;
+  for (int row = vertices - 1; row >= 0; --row) {
+    if (threadIdx.x == 0) neighbor_count = 0;
+    __syncthreads();
+    const std::size_t base = static_cast<std::size_t>(row) * words;
+    for (int word = threadIdx.x; word < words; word += blockDim.x) {
+      std::uint64_t remaining = reach[base + word];
+      if (word == row / 64) remaining &= ~(1ULL << (row & 63));
+      while (remaining != 0) {
+        const int bit = __ffsll(static_cast<long long>(remaining)) - 1;
+        const int position = atomicAdd(&neighbor_count, 1);
+        neighbors[position] = word * 64 + bit;
+        remaining &= remaining - 1;
+      }
+    }
+    __syncthreads();
+    const int count = neighbor_count;
+    for (int word = threadIdx.x; word < words; word += blockDim.x) {
+      std::uint64_t output = reach[base + word];
+      for (int index = 0; index < count; ++index) {
+        output |= reach[static_cast<std::size_t>(neighbors[index]) * words +
+                        word];
+      }
+      reach[base + word] = output;
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void ClosePivotBlock(const std::uint64_t *reach,
                                 std::uint64_t *pivot_masks, int words,
                                 int block_start, int block_size) {
@@ -419,6 +451,13 @@ void LaunchInitialize(std::uint64_t *reachability, int vertices, int words,
                       cudaStream_t stream) {
   AddDiagonalAndMask<<<(vertices + 255) / 256, 256, 0, stream>>>(
       reachability, vertices, words);
+}
+
+void LaunchUpperTriangularClosure(std::uint64_t *reachability,
+                                  std::uint64_t *scratch, int vertices,
+                                  int words, cudaStream_t stream) {
+  CloseUpperTriangularDag<<<1, 256, 0, stream>>>(
+      reachability, reinterpret_cast<int *>(scratch), vertices, words);
 }
 
 void LaunchPivotBlock(std::uint64_t *reachability,
