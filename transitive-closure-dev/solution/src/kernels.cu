@@ -68,6 +68,7 @@ __global__ void BuildPivotRows(const std::uint64_t *reach,
 template <bool SkipEmpty>
 __global__ void ApplyPivotBlock(std::uint64_t *reach,
                                 const std::uint64_t *pivot_rows,
+                                const std::uint64_t *pivot_masks,
                                 int vertices, int words, int block_start,
                                 int block_size) {
   const int row = blockIdx.x;
@@ -80,10 +81,21 @@ __global__ void ApplyPivotBlock(std::uint64_t *reach,
   if constexpr (SkipEmpty) {
     if (row_mask == 0) return;
   }
+  std::uint64_t selected_mask = 0;
+  if ((threadIdx.x & 31) == 0) {
+    std::uint64_t remaining = row_mask;
+    while (remaining != 0) {
+      const int source = __ffsll(static_cast<long long>(remaining)) - 1;
+      selected_mask |= 1ULL << source;
+      remaining &= ~pivot_masks[source];
+    }
+  }
+  selected_mask = __shfl_sync(0xffffffffU, selected_mask, 0);
+  if (selected_mask == 0) return;
 
   for (int word = threadIdx.x; word < words; word += blockDim.x) {
     std::uint64_t output = reach[base + word];
-    std::uint64_t remaining = row_mask;
+    std::uint64_t remaining = selected_mask;
     while (remaining != 0) {
       const int source = __ffsll(static_cast<long long>(remaining)) - 1;
       output |= pivot_rows[static_cast<std::size_t>(source) * words + word];
@@ -113,9 +125,11 @@ void LaunchPivotBlock(std::uint64_t *reachability,
       reachability, pivot_rows, pivot_masks, words, block_start, block_size);
   if (words <= 256) {
     ApplyPivotBlock<true><<<vertices, 128, 0, stream>>>(
-        reachability, pivot_rows, vertices, words, block_start, block_size);
+        reachability, pivot_rows, pivot_masks, vertices, words, block_start,
+        block_size);
   } else {
     ApplyPivotBlock<false><<<vertices, 128, 0, stream>>>(
-        reachability, pivot_rows, vertices, words, block_start, block_size);
+        reachability, pivot_rows, pivot_masks, vertices, words, block_start,
+        block_size);
   }
 }
