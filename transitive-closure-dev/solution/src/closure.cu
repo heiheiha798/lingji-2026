@@ -46,7 +46,8 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
       !CudaOk(cudaMalloc(&d.reachability, bytes)) ||
       !CudaOk(cudaMalloc(&d.pivot_rows, pivot_bytes)) ||
       !CudaOk(cudaMalloc(&d.pivot_masks,
-                         2 * kPivotBlock * sizeof(std::uint64_t)))) {
+                         (2 * kPivotBlock + 1) *
+                             sizeof(std::uint64_t)))) {
     return 2;
   }
   if (words_per_row <= 512) {

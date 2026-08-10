@@ -59,10 +59,17 @@ __global__ void ClosePivotBlock(const std::uint64_t *reach,
     }
     __syncthreads();
   }
+  const bool row_identity =
+      row >= block_size ||
+      (row < 64
+           ? row_mask0 == (1ULL << row) && row_mask1 == 0
+           : row_mask0 == 0 && row_mask1 == (1ULL << (row - 64)));
+  const int block_identity = __syncthreads_and(row_identity);
   if (row < block_size) {
     pivot_masks[2 * row] = row_mask0;
     pivot_masks[2 * row + 1] = row_mask1;
   }
+  if (row == 0) pivot_masks[2 * kPivotBlock] = block_identity;
 }
 
 __global__ void BuildPivotRows(const std::uint64_t *reach,
@@ -116,24 +123,29 @@ __global__ void ApplyPivotBlock(std::uint64_t *reach,
   }
   std::uint64_t selected_mask0 = 0;
   std::uint64_t selected_mask1 = 0;
-  if ((threadIdx.x & 31) == 0) {
-    std::uint64_t remaining0 = row_mask0;
-    std::uint64_t remaining1 = row_mask1;
-    while ((remaining0 | remaining1) != 0) {
-      int source;
-      if (remaining0 != 0) {
-        source = __ffsll(static_cast<long long>(remaining0)) - 1;
-        selected_mask0 |= 1ULL << source;
-      } else {
-        source = 64 + __ffsll(static_cast<long long>(remaining1)) - 1;
-        selected_mask1 |= 1ULL << (source - 64);
+  if (pivot_masks[2 * kPivotBlock] != 0) {
+    selected_mask0 = row_mask0;
+    selected_mask1 = row_mask1;
+  } else {
+    if ((threadIdx.x & 31) == 0) {
+      std::uint64_t remaining0 = row_mask0;
+      std::uint64_t remaining1 = row_mask1;
+      while ((remaining0 | remaining1) != 0) {
+        int source;
+        if (remaining0 != 0) {
+          source = __ffsll(static_cast<long long>(remaining0)) - 1;
+          selected_mask0 |= 1ULL << source;
+        } else {
+          source = 64 + __ffsll(static_cast<long long>(remaining1)) - 1;
+          selected_mask1 |= 1ULL << (source - 64);
+        }
+        remaining0 &= ~pivot_masks[2 * source];
+        remaining1 &= ~pivot_masks[2 * source + 1];
       }
-      remaining0 &= ~pivot_masks[2 * source];
-      remaining1 &= ~pivot_masks[2 * source + 1];
     }
+    selected_mask0 = __shfl_sync(0xffffffffU, selected_mask0, 0);
+    selected_mask1 = __shfl_sync(0xffffffffU, selected_mask1, 0);
   }
-  selected_mask0 = __shfl_sync(0xffffffffU, selected_mask0, 0);
-  selected_mask1 = __shfl_sync(0xffffffffU, selected_mask1, 0);
   if ((selected_mask0 | selected_mask1) == 0) return;
 
   const bool single_generator =
