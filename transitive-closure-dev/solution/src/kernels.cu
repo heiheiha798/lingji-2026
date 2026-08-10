@@ -80,25 +80,25 @@ __global__ void BuildPivotRows(const std::uint64_t *reach,
   if (row >= block_size) return;
   const std::uint64_t mask0 = pivot_masks[2 * row];
   const std::uint64_t mask1 = pivot_masks[2 * row + 1];
-  for (int word = threadIdx.x; word < words; word += blockDim.x) {
-    std::uint64_t output = 0;
-    std::uint64_t remaining0 = mask0;
-    while (remaining0 != 0) {
-      const int source = __ffsll(static_cast<long long>(remaining0)) - 1;
-      output |= reach[static_cast<std::size_t>(block_start + source) * words +
-                      word];
-      remaining0 &= remaining0 - 1;
-    }
-    std::uint64_t remaining1 = mask1;
-    while (remaining1 != 0) {
-      const int source =
-          64 + __ffsll(static_cast<long long>(remaining1)) - 1;
-      output |= reach[static_cast<std::size_t>(block_start + source) * words +
-                      word];
-      remaining1 &= remaining1 - 1;
-    }
-    pivot_rows[static_cast<std::size_t>(row) * words + word] = output;
+  const int word = blockIdx.y * blockDim.x + threadIdx.x;
+  if (word >= words) return;
+  std::uint64_t output = 0;
+  std::uint64_t remaining0 = mask0;
+  while (remaining0 != 0) {
+    const int source = __ffsll(static_cast<long long>(remaining0)) - 1;
+    output |= reach[static_cast<std::size_t>(block_start + source) * words +
+                    word];
+    remaining0 &= remaining0 - 1;
   }
+  std::uint64_t remaining1 = mask1;
+  while (remaining1 != 0) {
+    const int source =
+        64 + __ffsll(static_cast<long long>(remaining1)) - 1;
+    output |= reach[static_cast<std::size_t>(block_start + source) * words +
+                    word];
+    remaining1 &= remaining1 - 1;
+  }
+  pivot_rows[static_cast<std::size_t>(row) * words + word] = output;
 }
 
 template <bool SkipEmpty>
@@ -204,7 +204,7 @@ void LaunchPivotBlock(std::uint64_t *reachability,
   const int block_size = remaining < kPivotBlock ? remaining : kPivotBlock;
   ClosePivotBlock<<<1, kPivotBlock, 0, stream>>>(
       reachability, pivot_masks, words, block_start, block_size);
-  BuildPivotRows<<<block_size, 128, 0, stream>>>(
+  BuildPivotRows<<<dim3(block_size, (words + 127) / 128), 128, 0, stream>>>(
       reachability, pivot_rows, pivot_masks, words, block_start, block_size);
   if (words <= 256) {
     ApplyPivotBlock<true><<<vertices, 128, 0, stream>>>(
