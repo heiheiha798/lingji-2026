@@ -68,16 +68,21 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
     if (!CudaOk(cudaMemsetAsync(d.active, 0, sizeof(int), d.stream))) {
       return 2;
     }
-    LaunchSweep(a, b, d.odometer, rows, cols, d.active, d.stream);
-    if (!CudaOk(cudaGetLastError()) ||
-        !CudaOk(cudaMemcpyAsync(&host_active, d.active, sizeof(int),
+    for (int sweep = 0; sweep < 8; ++sweep) {
+      LaunchSweep(a, b, d.odometer, rows, cols,
+                  sweep == 7 ? d.active : nullptr, d.stream);
+      if (!CudaOk(cudaGetLastError())) {
+        return 2;
+      }
+      auto *tmp = a;
+      a = b;
+      b = tmp;
+    }
+    if (!CudaOk(cudaMemcpyAsync(&host_active, d.active, sizeof(int),
                                 cudaMemcpyDeviceToHost, d.stream)) ||
         !CudaOk(cudaStreamSynchronize(d.stream))) {
       return 2;
     }
-    auto *tmp = a;
-    a = b;
-    b = tmp;
   }
   LaunchStore(a, d.stable, n, d.stream);
   if (!CudaOk(cudaGetLastError()) ||

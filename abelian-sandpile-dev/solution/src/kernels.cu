@@ -15,6 +15,7 @@ __global__ void InitializeKernel(const std::uint32_t *input,
   }
 }
 
+template <bool CheckActive>
 __global__ void SweepKernel(const std::uint64_t *__restrict__ input,
                             std::uint64_t *__restrict__ output,
                             std::uint64_t *__restrict__ odometer, int rows,
@@ -32,8 +33,12 @@ __global__ void SweepKernel(const std::uint64_t *__restrict__ input,
   if (y > 0) next += input[i - cols] >> 2;
   if (y + 1 < rows) next += input[i + cols] >> 2;
   output[i] = next;
-  odometer[i] += q;
-  if (q != 0) atomicExch(active, 1);
+  if (q != 0) {
+    odometer[i] += q;
+    if constexpr (CheckActive) {
+      atomicExch(active, 1);
+    }
+  }
 }
 
 __global__ void StoreKernel(const std::uint64_t *height,
@@ -58,8 +63,13 @@ void LaunchSweep(const std::uint64_t *input, std::uint64_t *output,
   const dim3 block(32, 8);
   const dim3 grid((cols + block.x - 1) / block.x,
                   (rows + block.y - 1) / block.y);
-  SweepKernel<<<grid, block, 0, stream>>>(input, output, odometer, rows, cols,
-                                          active);
+  if (active == nullptr) {
+    SweepKernel<false><<<grid, block, 0, stream>>>(input, output, odometer, rows,
+                                                   cols, nullptr);
+  } else {
+    SweepKernel<true><<<grid, block, 0, stream>>>(input, output, odometer, rows,
+                                                  cols, active);
+  }
 }
 
 void LaunchStore(const std::uint64_t *height, std::uint8_t *stable,
