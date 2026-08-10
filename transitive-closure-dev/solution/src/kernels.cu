@@ -65,6 +65,7 @@ __global__ void BuildPivotRows(const std::uint64_t *reach,
   }
 }
 
+template <bool SkipEmpty>
 __global__ void ApplyPivotBlock(std::uint64_t *reach,
                                 const std::uint64_t *pivot_rows,
                                 int vertices, int words, int block_start,
@@ -76,6 +77,9 @@ __global__ void ApplyPivotBlock(std::uint64_t *reach,
   row_mask &= block_size == kPivotBlock
                   ? ~0ULL
                   : (1ULL << block_size) - 1ULL;
+  if constexpr (SkipEmpty) {
+    if (row_mask == 0) return;
+  }
 
   for (int word = threadIdx.x; word < words; word += blockDim.x) {
     std::uint64_t output = reach[base + word];
@@ -107,6 +111,11 @@ void LaunchPivotBlock(std::uint64_t *reachability,
       reachability, pivot_masks, words, block_start, block_size);
   BuildPivotRows<<<block_size, 128, 0, stream>>>(
       reachability, pivot_rows, pivot_masks, words, block_start, block_size);
-  ApplyPivotBlock<<<vertices, 128, 0, stream>>>(
-      reachability, pivot_rows, vertices, words, block_start, block_size);
+  if (words <= 256) {
+    ApplyPivotBlock<true><<<vertices, 128, 0, stream>>>(
+        reachability, pivot_rows, vertices, words, block_start, block_size);
+  } else {
+    ApplyPivotBlock<false><<<vertices, 128, 0, stream>>>(
+        reachability, pivot_rows, vertices, words, block_start, block_size);
+  }
 }
