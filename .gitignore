@@ -6,3 +6,6 @@ tilelang_kda_varlen_prefill/artifacts/
 tilelang_kda_varlen_prefill/nsys_reports/
 kda_stateful_hpcgame/artifacts/
 kda_stateful_hpcgame/ncu_reports/
+kda_stateful_hpcgame/nsys_reports/
+kda_stateful_hpcgame/compile_artifacts/
+kda_stateful_hpcgame/compile_reports/

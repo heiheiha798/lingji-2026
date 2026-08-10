@@ -18,6 +18,9 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+if os.environ.get("FLA_DISABLE_BACKEND_DISPATCH") != "1":
+    raise RuntimeError("set FLA_DISABLE_BACKEND_DISPATCH=1 before importing FLA")
+
 import torch
 import fla
 import triton
@@ -383,6 +386,7 @@ def benchmark_case(
     replays: int,
     decode_sample_steps: int,
     nvtx: bool,
+    cuda_profiler_api: bool,
 ) -> dict[str, object]:
     append_calls = [allocate_append(lengths, case.heads) for lengths in case.append_lengths]
     decode_call = allocate_decode(case.batch, case.heads) if case.decode_steps else None
@@ -416,6 +420,8 @@ def benchmark_case(
     for replay in range(replays):
         state_holder = [initial_state.clone()]
         torch.cuda.synchronize()
+        if cuda_profiler_api:
+            torch.cuda.cudart().cudaProfilerStart()
         append_ms = 0.0
         append_calls_ms = []
         for index, call in enumerate(append_calls):
@@ -453,6 +459,9 @@ def benchmark_case(
         replay_append_ms.append(append_ms)
         replay_append_calls_ms.append(append_calls_ms)
         replay_decode_ms.append(decode_ms)
+        if cuda_profiler_api:
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
 
     append_ms = statistics.mean(replay_append_ms)
     decode_sample_ms = statistics.mean(replay_decode_ms)
@@ -496,6 +505,7 @@ def main() -> None:
     parser.add_argument("--decode-sample-steps", type=int, default=128)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--nvtx", action="store_true")
+    parser.add_argument("--cuda-profiler-api", action="store_true")
     args = parser.parse_args()
 
     if torch.cuda.device_count() != 1:
@@ -508,6 +518,11 @@ def main() -> None:
         raise RuntimeError("set CUDA_VISIBLE_DEVICES to physical GPU 6 or 7")
     if args.warmup < 1 or args.replays < 1 or args.decode_sample_steps < 1:
         raise ValueError("warmup, replays, and decode-sample-steps must be positive")
+    fla_git_commit = os.environ.get("FLA_GIT_COMMIT")
+    if fla_git_commit is None:
+        raise RuntimeError("set FLA_GIT_COMMIT explicitly")
+    if args.output is not None and args.output.exists():
+        raise ValueError(f"output already exists: {args.output}")
 
     print(
         json.dumps(
@@ -632,15 +647,35 @@ def main() -> None:
         print(json.dumps({"validation": metrics}, indent=2, sort_keys=True))
         return
 
-    selected_cases = CASES if args.cases == "all" else tuple(
-        case for case in CASES if case.name in args.cases.split(",")
-    )
-    selected_candidates = tuple(item for item in args.candidates.split(",") if item)
-    if not selected_cases:
-        raise ValueError(f"no cases selected by {args.cases!r}")
+    if args.cases == "all":
+        selected_cases = CASES
+    else:
+        requested_cases = args.cases.split(",")
+        if not requested_cases or any(not item for item in requested_cases):
+            raise ValueError("--cases must be 'all' or a comma-separated case list")
+        unknown_cases = set(requested_cases) - {case.name for case in CASES}
+        if unknown_cases:
+            raise ValueError(f"unknown cases: {sorted(unknown_cases)}")
+        if len(requested_cases) != len(set(requested_cases)):
+            raise ValueError("--cases contains duplicates")
+        selected_cases = tuple(case for case in CASES if case.name in requested_cases)
+    selected_candidates = tuple(args.candidates.split(","))
+    if not selected_candidates or any(not item for item in selected_candidates):
+        raise ValueError("--candidates must be a comma-separated candidate list")
+    if len(selected_candidates) != len(set(selected_candidates)):
+        raise ValueError("--candidates contains duplicates")
     unknown = set(selected_candidates) - set(CANDIDATES)
     if unknown:
         raise ValueError(f"unknown candidates: {sorted(unknown)}")
+    if args.cuda_profiler_api and (
+        len(selected_cases) != 1
+        or len(selected_candidates) != 1
+        or args.replays != 1
+    ):
+        raise ValueError(
+            "--cuda-profiler-api requires exactly one case, one candidate, "
+            "and --replays 1"
+        )
 
     torch.manual_seed(20260810)
     started = time.time()
@@ -654,6 +689,7 @@ def main() -> None:
                 args.replays,
                 args.decode_sample_steps,
                 args.nvtx,
+                args.cuda_profiler_api,
             )
             results.append(result)
             print(json.dumps(result, sort_keys=True), flush=True)
@@ -672,7 +708,7 @@ def main() -> None:
             "physical_gpu": physical_gpu,
             "sm": "89",
             "torch": torch.__version__,
-            "fla_git": os.environ.get("FLA_GIT_COMMIT", "unknown"),
+            "fla_git": fla_git_commit,
             "synthetic_inputs": True,
             "decode_sample_steps": args.decode_sample_steps,
             "warmup": args.warmup,
