@@ -14,7 +14,7 @@ namespace {
 
 constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr int kThreads = 256;
-constexpr std::uint32_t kImplementationId = 4;
+constexpr std::uint32_t kImplementationId = 5;
 
 __device__ __constant__ std::int8_t g_triangle_table[256][16];
 __device__ __constant__ std::uint8_t g_triangle_count[256];
@@ -156,6 +156,44 @@ __global__ void generate_triangles(
   }
 }
 
+__global__ void generate_triangles_by_row(
+    const float* __restrict__ volume, int nx, int ny, int cx, int cy,
+    const float* __restrict__ isovalues, int iso,
+    const std::uint8_t* __restrict__ counts,
+    const std::uint32_t* __restrict__ offsets,
+    const std::uint64_t* __restrict__ totals,
+    icecarver::Triangle* __restrict__ triangles, std::uint64_t capacity) {
+  if (totals[iso] > capacity) {
+    return;
+  }
+  const std::uint32_t row_id = blockIdx.x;
+  const int y = static_cast<int>(row_id % static_cast<std::uint32_t>(cy));
+  const int z = static_cast<int>(row_id / static_cast<std::uint32_t>(cy));
+  for (int x = threadIdx.x; x < cx; x += blockDim.x) {
+    const std::uint32_t cell_id = row_id * static_cast<std::uint32_t>(cx) +
+                                  static_cast<std::uint32_t>(x);
+    const std::uint32_t count = counts[cell_id];
+    if (count == 0) {
+      continue;
+    }
+    const std::uint32_t offset = offsets[cell_id];
+    if (static_cast<std::uint64_t>(offset) + count > capacity) {
+      continue;
+    }
+
+    float values[8];
+    icecarver::mc::load_corners(volume, nx, ny, x, y, z, values);
+    const float isovalue = isovalues[iso];
+    const std::uint8_t cube_case =
+        icecarver::mc::case_index(values, isovalue);
+    const std::int8_t* row = g_triangle_table[cube_case];
+    for (std::uint32_t triangle = 0; triangle < count; ++triangle) {
+      triangles[offset + triangle] = icecarver::mc::make_triangle(
+          row, static_cast<int>(triangle), x, y, z, values, isovalue);
+    }
+  }
+}
+
 }  // namespace
 
 extern "C" int icecarver_solve(const icecarver::Input* input,
@@ -249,6 +287,8 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
       static_cast<std::size_t>(input->num_isovalues) * sizeof(std::uint64_t),
       stream));
 
+  const unsigned int rows =
+      num_cells / static_cast<std::uint32_t>(input->nx - 1);
   const unsigned int blocks =
       (num_cells + static_cast<std::uint32_t>(kThreads) - 1U) /
       static_cast<std::uint32_t>(kThreads);
@@ -269,11 +309,19 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
     ICECARVER_RETURN_IF_LAUNCH_ERROR();
 
     if (input->emit_triangles != 0) {
-      generate_triangles<<<blocks, kThreads, 0, stream>>>(
-          input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
-          num_cells, input->isovalues, iso, iso_counts, offsets,
-          output->triangle_counts, output->triangles[iso],
-          output->capacities[iso]);
+      if (input->num_isovalues == icecarver::kMaxIsovalues) {
+        generate_triangles_by_row<<<rows, kThreads, 0, stream>>>(
+            input->volume, input->nx, input->ny, input->nx - 1,
+            input->ny - 1, input->isovalues, iso, iso_counts, offsets,
+            output->triangle_counts, output->triangles[iso],
+            output->capacities[iso]);
+      } else {
+        generate_triangles<<<blocks, kThreads, 0, stream>>>(
+            input->volume, input->nx, input->ny, input->nx - 1,
+            input->ny - 1, num_cells, input->isovalues, iso, iso_counts,
+            offsets, output->triangle_counts, output->triangles[iso],
+            output->capacities[iso]);
+      }
       ICECARVER_RETURN_IF_LAUNCH_ERROR();
     }
   }
