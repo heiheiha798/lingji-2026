@@ -10,13 +10,15 @@
 namespace {
 
 struct DeviceResources {
-  std::uint64_t *adjacency = nullptr;
   std::uint64_t *reachability = nullptr;
+  std::uint64_t *pivot_rows = nullptr;
+  std::uint64_t *pivot_masks = nullptr;
   cudaStream_t stream = nullptr;
 
   ~DeviceResources() {
+    cudaFree(pivot_masks);
+    cudaFree(pivot_rows);
     cudaFree(reachability);
-    cudaFree(adjacency);
     if (stream != nullptr) {
       cudaStreamDestroy(stream);
     }
@@ -36,21 +38,27 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   }
   const std::size_t bytes = static_cast<std::size_t>(vertices) *
                             words_per_row * sizeof(std::uint64_t);
+  constexpr int kPivotBlock = 64;
   DeviceResources d;
   if (!CudaOk(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking)) ||
-      !CudaOk(cudaMalloc(&d.adjacency, bytes)) ||
       !CudaOk(cudaMalloc(&d.reachability, bytes)) ||
-      !CudaOk(cudaMemcpyAsync(d.adjacency, adjacency, bytes,
+      !CudaOk(cudaMalloc(&d.pivot_rows,
+                         static_cast<std::size_t>(kPivotBlock) *
+                             words_per_row * sizeof(std::uint64_t))) ||
+      !CudaOk(cudaMalloc(&d.pivot_masks,
+                         kPivotBlock * sizeof(std::uint64_t))) ||
+      !CudaOk(cudaMemcpyAsync(d.reachability, adjacency, bytes,
                               cudaMemcpyHostToDevice, d.stream))) {
     return 2;
   }
-  LaunchInitialize(d.adjacency, d.reachability, vertices, words_per_row,
-                   d.stream);
+  LaunchInitialize(d.reachability, vertices, words_per_row, d.stream);
   if (!CudaOk(cudaGetLastError())) {
     return 2;
   }
-  for (int pivot = 0; pivot < vertices; ++pivot) {
-    LaunchPivot(d.reachability, vertices, words_per_row, pivot, d.stream);
+  for (int block_start = 0; block_start < vertices;
+       block_start += kPivotBlock) {
+    LaunchPivotBlock(d.reachability, d.pivot_rows, d.pivot_masks, vertices,
+                     words_per_row, block_start, d.stream);
   }
   if (!CudaOk(cudaGetLastError()) ||
       !CudaOk(cudaMemcpyAsync(reachability, d.reachability, bytes,
