@@ -98,14 +98,14 @@ extern "C" int sandpile_run(const std::uint32_t *initial,
     if (!CudaOk(cudaMemsetAsync(d.active, 0, sizeof(int), d.stream))) {
       return 2;
     }
-    for (int sweep = 0; sweep < 4; ++sweep) {
+    for (int sweep = 0; sweep < 8; ++sweep) {
       x_begin = x_begin > 4 ? x_begin - 4 : 0;
       y_begin = y_begin > 4 ? y_begin - 4 : 0;
       x_end = x_end + 4 < cols ? x_end + 4 : cols;
       y_end = y_end + 4 < rows ? y_end + 4 : rows;
       LaunchSweep(a, b, d.odometer, rows, cols, x_begin, y_begin, x_end, y_end,
                   x_begin != 0 || y_begin != 0 || x_end != cols || y_end != rows,
-                  sweep == 3 ? d.active : nullptr, height_width, d.stream);
+                  sweep == 7 ? d.active : nullptr, height_width, d.stream);
       if (!CudaOk(cudaGetLastError())) {
         return 2;
       }
