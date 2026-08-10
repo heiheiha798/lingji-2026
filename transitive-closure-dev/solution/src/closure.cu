@@ -10,7 +10,6 @@
 namespace {
 
 struct DeviceResources {
-  std::uint8_t *allocation = nullptr;
   std::uint64_t *reachability = nullptr;
   std::uint64_t *pivot_rows = nullptr;
   std::uint64_t *pivot_masks = nullptr;
@@ -19,7 +18,9 @@ struct DeviceResources {
   cudaStream_t stream = nullptr;
 
   ~DeviceResources() {
-    cudaFree(allocation);
+    cudaFree(pivot_masks);
+    cudaFree(pivot_rows);
+    cudaFree(reachability);
     if (registered_output != nullptr) {
       cudaHostUnregister(registered_output);
     }
@@ -48,25 +49,15 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   constexpr int kPivotBlock = 256;
   const std::size_t pivot_bytes = static_cast<std::size_t>(kPivotBlock) *
                                   words_per_row * sizeof(std::uint64_t);
-  constexpr std::size_t kDeviceAlignment = 256;
-  const std::size_t reach_storage_bytes =
-      (bytes + kDeviceAlignment - 1) & ~(kDeviceAlignment - 1);
-  const std::size_t pivot_storage_bytes =
-      (pivot_bytes + kDeviceAlignment - 1) & ~(kDeviceAlignment - 1);
-  const std::size_t pivot_mask_bytes =
-      (4 * kPivotBlock + 1) * sizeof(std::uint64_t);
   DeviceResources d;
   if (!CudaOk(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking)) ||
-      !CudaOk(cudaMalloc(&d.allocation, reach_storage_bytes +
-                                            pivot_storage_bytes +
-                                            pivot_mask_bytes))) {
+      !CudaOk(cudaMalloc(&d.reachability, bytes)) ||
+      !CudaOk(cudaMalloc(&d.pivot_rows, pivot_bytes)) ||
+      !CudaOk(cudaMalloc(&d.pivot_masks,
+                         (4 * kPivotBlock + 1) *
+                             sizeof(std::uint64_t)))) {
     return 2;
   }
-  d.reachability = reinterpret_cast<std::uint64_t *>(d.allocation);
-  d.pivot_rows = reinterpret_cast<std::uint64_t *>(
-      d.allocation + reach_storage_bytes);
-  d.pivot_masks = reinterpret_cast<std::uint64_t *>(
-      d.allocation + reach_storage_bytes + pivot_storage_bytes);
   if (words_per_row <= 512) {
     cudaStreamAttrValue stream_attribute{};
     stream_attribute.accessPolicyWindow.base_ptr = d.pivot_rows;
