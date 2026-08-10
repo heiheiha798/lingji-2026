@@ -2,6 +2,7 @@
 
 #include "baseline_kernels.cuh"
 
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -153,6 +154,50 @@ __global__ void CloseUpperTriangularDagBatch(std::uint64_t *reach,
   }
 }
 
+__global__ void CloseUpperTriangularDagCooperative(
+    std::uint64_t *reach, const int *batch_starts, int batch_count,
+    int vertices, int words) {
+  __shared__ int neighbor_count;
+  __shared__ int neighbors[kDagBatchNeighborCapacity];
+  const cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+  int batch_end = vertices;
+  for (int batch = 0; batch < batch_count; ++batch) {
+    const int batch_start = batch_starts[batch];
+    const bool active = blockIdx.x < batch_end - batch_start;
+    const int row = batch_start + blockIdx.x;
+    if (threadIdx.x == 0) neighbor_count = 0;
+    __syncthreads();
+    if (active) {
+      const std::size_t base = static_cast<std::size_t>(row) * words;
+      for (int word = threadIdx.x; word < words; word += blockDim.x) {
+        std::uint64_t remaining = reach[base + word];
+        if (word == row / 64) remaining &= ~(1ULL << (row & 63));
+        while (remaining != 0) {
+          const int bit = __ffsll(static_cast<long long>(remaining)) - 1;
+          const int position = atomicAdd(&neighbor_count, 1);
+          neighbors[position] = word * 64 + bit;
+          remaining &= remaining - 1;
+        }
+      }
+    }
+    __syncthreads();
+    if (active) {
+      const std::size_t base = static_cast<std::size_t>(row) * words;
+      const int count = neighbor_count;
+      for (int word = threadIdx.x; word < words; word += blockDim.x) {
+        std::uint64_t output = reach[base + word];
+        for (int index = 0; index < count; ++index) {
+          output |=
+              reach[static_cast<std::size_t>(neighbors[index]) * words + word];
+        }
+        reach[base + word] = output;
+      }
+    }
+    grid.sync();
+    batch_end = batch_start;
+  }
+}
+
 struct DeviceResources {
   std::uint64_t *reachability = nullptr;
   std::uint64_t *pivot_rows = nullptr;
@@ -220,6 +265,8 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   }
   std::vector<int> dag_batch_starts;
   bool use_parallel_dag_batches = false;
+  bool use_cooperative_dag_batches = false;
+  int maximum_dag_batch_size = 0;
   constexpr int kPivotBlock = 256;
   const std::size_t pivot_bytes = static_cast<std::size_t>(kPivotBlock) *
                                   words_per_row * sizeof(std::uint64_t);
@@ -298,10 +345,33 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
                    dag_descriptors[batch_start - 1]) >= batch_end) {
           --batch_start;
         }
+        const int batch_size = batch_end - batch_start;
+        if (batch_size > maximum_dag_batch_size)
+          maximum_dag_batch_size = batch_size;
         dag_batch_starts.push_back(batch_start);
         batch_end = batch_start;
       }
       use_parallel_dag_batches = dag_batch_starts.size() <= 256;
+      if (use_parallel_dag_batches) {
+        int device = 0;
+        int cooperative_launch = 0;
+        int multiprocessors = 0;
+        int active_blocks_per_multiprocessor = 0;
+        if (!CudaOk(cudaGetDevice(&device)) ||
+            !CudaOk(cudaDeviceGetAttribute(
+                &cooperative_launch, cudaDevAttrCooperativeLaunch, device)) ||
+            !CudaOk(cudaDeviceGetAttribute(
+                &multiprocessors, cudaDevAttrMultiProcessorCount, device)) ||
+            !CudaOk(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks_per_multiprocessor,
+                CloseUpperTriangularDagCooperative, 256, 0))) {
+          return 2;
+        }
+        use_cooperative_dag_batches =
+            cooperative_launch != 0 &&
+            maximum_dag_batch_size <=
+                active_blocks_per_multiprocessor * multiprocessors;
+      }
     }
   } else {
     LaunchInitialize(d.reachability, vertices, words_per_row, d.stream);
@@ -311,12 +381,36 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   }
   if (use_dag_closure) {
     if (use_parallel_dag_batches) {
-      int batch_end = vertices;
-      for (const int batch_start : dag_batch_starts) {
-        CloseUpperTriangularDagBatch<<<batch_end - batch_start, 256, 0,
-                                       d.stream>>>(
-            d.reachability, batch_start, vertices, words_per_row);
-        batch_end = batch_start;
+      if (use_cooperative_dag_batches) {
+        if (!CudaOk(cudaMemcpyAsync(
+                d.pivot_masks, dag_batch_starts.data(),
+                dag_batch_starts.size() * sizeof(int),
+                cudaMemcpyHostToDevice, d.stream))) {
+          return 2;
+        }
+        std::uint64_t *reach_argument = d.reachability;
+        const int *batch_starts_argument =
+            reinterpret_cast<const int *>(d.pivot_masks);
+        int batch_count_argument = static_cast<int>(dag_batch_starts.size());
+        int vertices_argument = vertices;
+        int words_argument = words_per_row;
+        void *arguments[] = {&reach_argument, &batch_starts_argument,
+                             &batch_count_argument, &vertices_argument,
+                             &words_argument};
+        if (!CudaOk(cudaLaunchCooperativeKernel(
+                CloseUpperTriangularDagCooperative,
+                dim3(maximum_dag_batch_size), dim3(256), arguments, 0,
+                d.stream))) {
+          return 2;
+        }
+      } else {
+        int batch_end = vertices;
+        for (const int batch_start : dag_batch_starts) {
+          CloseUpperTriangularDagBatch<<<batch_end - batch_start, 256, 0,
+                                         d.stream>>>(
+              d.reachability, batch_start, vertices, words_per_row);
+          batch_end = batch_start;
+        }
       }
     } else {
       CloseUpperTriangularDag<<<1, 256, 0, d.stream>>>(
