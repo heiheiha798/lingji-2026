@@ -2,5 +2,6 @@
 # 且需 Python 3.11（fla 0.5.1 在 3.10 下 import 即失败）。详见 INSTALL.md。
 torch==2.6.0
 triton==3.2.0
+tilelang==0.1.12
 flash-linear-attention==0.5.1   # 提供 fla.ops.gated_delta_rule（chunk_ / fused_recurrent_）
 numpy==2.1.3

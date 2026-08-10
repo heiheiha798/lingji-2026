@@ -4,7 +4,8 @@
 - 比赛平台为每名选手提供单张 NVIDIA RTX 4090 24GB 算力。
 - Ubuntu 22.04（x86-64），NVIDIA Driver 570.153.02，CUDA Toolkit 12.8。
 - **Python 3.11**（不是 3.10——见下方「环境坑」第 1 条）。
-- 实测组合：Python 3.11 + `torch==2.6.0`(cu124) + `triton==3.2.0` + `flash-linear-attention==0.5.1`。
+- 实测组合：Python 3.11 + `torch==2.6.0`(cu124) + `triton==3.2.0` +
+  `tilelang==0.1.12` + `flash-linear-attention==0.5.1`。
 
 ## 安装
 ```bash
@@ -28,6 +29,8 @@ python -m pip install -r requirements.txt
    （不同 shape 用不同变量名）。
 4. **fla 的 chunk kernel 链不能干净地被 CUDA graph capture**（内部 autotune + 动态中间分配）——想上
    CUDA graph 得自己写全部 kernel、或用固定 buffer 且避开 fla 的 autotune 路径。
+5. 当前优化提交会 import `tilelang`，必须安装 requirements 中固定的 0.1.12；它在首次遇到新的
+   `(B,T)` 时 JIT 编译静态特化 kernel，编译发生在评测 warmup/正确性阶段，不进入 CUDA Event 计时。
 
 ## 自检（真机第一次务必跑）
 ```bash
