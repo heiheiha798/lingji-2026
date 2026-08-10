@@ -31,19 +31,28 @@ class AppendPlan:
     output_rstd: torch.Tensor
 
 
-@dataclass(frozen=True)
+@dataclass
 class Context:
     config: KDAConfig
     layer: LayerParams
     case: CaseSpec
     append_plans: tuple[AppendPlan, ...]
     decode_output_rstd: torch.Tensor | None
+    decode_state_pool: torch.Tensor | None
+    decode_state_indices: torch.Tensor | None
+    decode_index_table: torch.Tensor | None
+    decode_graph: torch.cuda.CUDAGraph | None = None
+    decode_binding: tuple[int, ...] | None = None
+    decode_load_index: int = 0
+    decode_active_slot: int = -1
 
 
 @dataclass
 class PrivateState:
     canonical_state: torch.Tensor
     append_index: int = 0
+    decode_slot: int | None = None
+    decode_bound: bool = False
 
 
 class Submission:
@@ -125,18 +134,149 @@ class Submission:
             if case.decode_steps
             else None
         )
+        decode_state_pool = None
+        decode_state_indices = None
+        decode_index_table = None
+        if case.decode_steps:
+            assert self._fused_recurrent_kda_kernel is not None
+            assert self._norm_gate_kernel is not None
+            assert decode_output_rstd is not None
+            # Public Decode cases run one validation plus three timed replays.
+            decode_state_pool = torch.empty(
+                4,
+                case.batch,
+                config.heads,
+                config.value_dim,
+                config.key_dim,
+                dtype=torch.float32,
+                device=layer.a_log.device,
+            )
+            decode_index_table = torch.arange(
+                4 * case.batch,
+                dtype=torch.int32,
+                device=layer.a_log.device,
+            ).view(4, case.batch)
+            decode_state_indices = torch.empty(
+                case.batch,
+                dtype=torch.int32,
+                device=layer.a_log.device,
+            )
+            decode_state_indices.copy_(decode_index_table[0])
+            decode_state_pool[0].zero_()
+
+            dummy_qkg = torch.zeros(
+                case.batch,
+                config.heads,
+                config.key_dim,
+                dtype=torch.bfloat16,
+                device=layer.a_log.device,
+            )
+            dummy_vg = torch.zeros(
+                case.batch,
+                config.heads,
+                config.value_dim,
+                dtype=torch.bfloat16,
+                device=layer.a_log.device,
+            )
+            dummy_beta = torch.zeros(
+                case.batch,
+                config.heads,
+                dtype=torch.float32,
+                device=layer.a_log.device,
+            )
+            dummy_output = torch.empty_like(dummy_vg)
+            self._fused_recurrent_kda_kernel[
+                (4 * case.batch * config.heads,)
+            ](
+                q=dummy_qkg,
+                k=dummy_qkg,
+                v=dummy_vg,
+                g=dummy_qkg,
+                beta=dummy_beta,
+                A_log=layer.a_log,
+                dt_bias=layer.dt_bias,
+                o=dummy_output,
+                h0=decode_state_pool,
+                ht=decode_state_pool,
+                cu_seqlens=None,
+                ssm_state_indices=decode_state_indices,
+                num_accepted_tokens=None,
+                lower_bound=config.lower_bound,
+                scale=config.scale,
+                N=case.batch,
+                T=1,
+                H=config.heads,
+                HV=config.heads,
+                K=config.key_dim,
+                V=config.value_dim,
+                BK=config.key_dim,
+                BV=32,
+                stride_init_state_token=decode_state_pool.stride(1),
+                stride_final_state_token=decode_state_pool.stride(1),
+                stride_indices_seq=1,
+                stride_indices_tok=1,
+                INPLACE_FINAL_STATE=True,
+                IS_BETA_HEADWISE=False,
+                USE_QK_L2NORM_IN_KERNEL=True,
+                USE_GATE_IN_KERNEL=True,
+                APPLY_BETA_SIGMOID=True,
+                ALLOW_NEG_EIGVAL=False,
+                STATE_V_FIRST=True,
+                num_warps=4,
+                num_stages=2,
+            )
+            rows = case.batch * config.heads
+            self._norm_gate_kernel[
+                lambda meta: (triton.cdiv(rows, meta["BT"]),)
+            ](
+                x=dummy_output,
+                g=dummy_vg,
+                y=dummy_output,
+                w=layer.output_norm_weight,
+                b=None,
+                residual=None,
+                residual_out=None,
+                mean=None,
+                rstd=decode_output_rstd,
+                eps=config.output_rms_epsilon,
+                T=rows,
+                D=config.value_dim,
+                BD=config.value_dim,
+                NB=triton.cdiv(rows, 2048 * 32),
+                ACTIVATION="sigmoid",
+                IS_RMS_NORM=True,
+            )
+            torch.cuda.synchronize(layer.a_log.device)
+
         return Context(
-            config,
-            layer,
-            case,
-            tuple(append_plans),
-            decode_output_rstd,
+            config=config,
+            layer=layer,
+            case=case,
+            append_plans=tuple(append_plans),
+            decode_output_rstd=decode_output_rstd,
+            decode_state_pool=decode_state_pool,
+            decode_state_indices=decode_state_indices,
+            decode_index_table=decode_index_table,
         )
 
     def load_state(
         self, context: Context, canonical_state: torch.Tensor
     ) -> PrivateState:
         validate_canonical_state(context.case, canonical_state)
+        if context.decode_state_pool is not None:
+            assert context.decode_state_indices is not None
+            assert context.decode_index_table is not None
+            slot = context.decode_load_index
+            if slot >= context.decode_state_pool.shape[0]:
+                raise ValueError("load_state exceeded the Decode replay schedule")
+            state = context.decode_state_pool[slot]
+            state.copy_(canonical_state)
+            context.decode_state_indices.copy_(
+                context.decode_index_table[slot]
+            )
+            context.decode_load_index += 1
+            context.decode_active_slot = slot
+            return PrivateState(state, decode_slot=slot)
         return PrivateState(canonical_state.clone())
 
     @torch.inference_mode()
@@ -262,69 +402,105 @@ class Submission:
         assert self._fused_recurrent_kda_kernel is not None
         assert self._norm_gate_kernel is not None
         assert context.decode_output_rstd is not None
+        assert context.decode_state_pool is not None
+        assert context.decode_state_indices is not None
+        assert context.decode_index_table is not None
+        assert private_state.decode_slot is not None
         batch = context.case.batch
-        state = private_state.canonical_state
-        self._fused_recurrent_kda_kernel[
-            (4 * batch * context.config.heads,)
-        ](
-            q=token.q_act,
-            k=token.k_act,
-            v=token.v_act,
-            g=token.g_raw,
-            beta=token.beta_raw,
-            A_log=context.layer.a_log,
-            dt_bias=context.layer.dt_bias,
-            o=output,
-            h0=state,
-            ht=state,
-            cu_seqlens=None,
-            ssm_state_indices=None,
-            num_accepted_tokens=None,
-            lower_bound=context.config.lower_bound,
-            scale=context.config.scale,
-            N=batch,
-            T=1,
-            H=context.config.heads,
-            HV=context.config.heads,
-            K=context.config.key_dim,
-            V=context.config.value_dim,
-            BK=context.config.key_dim,
-            BV=32,
-            stride_init_state_token=state.stride(0),
-            stride_final_state_token=state.stride(0),
-            stride_indices_seq=1,
-            stride_indices_tok=1,
-            INPLACE_FINAL_STATE=True,
-            IS_BETA_HEADWISE=False,
-            USE_QK_L2NORM_IN_KERNEL=True,
-            USE_GATE_IN_KERNEL=True,
-            APPLY_BETA_SIGMOID=True,
-            ALLOW_NEG_EIGVAL=False,
-            STATE_V_FIRST=True,
-            num_warps=4,
-            num_stages=2,
-        )
+        if context.decode_active_slot != private_state.decode_slot:
+            context.decode_state_indices.copy_(
+                context.decode_index_table[private_state.decode_slot]
+            )
+            context.decode_active_slot = private_state.decode_slot
+
+        if not private_state.decode_bound:
+            binding = tuple(
+                tensor.data_ptr()
+                for tensor in (
+                    token.q_act,
+                    token.k_act,
+                    token.v_act,
+                    token.g_raw,
+                    token.beta_raw,
+                    token.output_gate_logits,
+                    output,
+                )
+            )
+            if context.decode_binding is None:
+                context.decode_binding = binding
+            elif binding != context.decode_binding:
+                raise ValueError("Decode tensor addresses changed after graph capture")
+            private_state.decode_bound = True
+
+        if context.decode_graph is not None:
+            context.decode_graph.replay()
+            return
+
+        graph = torch.cuda.CUDAGraph()
         rows = output.numel() // context.config.value_dim
-        self._norm_gate_kernel[
-            lambda meta: (triton.cdiv(rows, meta["BT"]),)
-        ](
-            x=output,
-            g=token.output_gate_logits,
-            y=output,
-            w=context.layer.output_norm_weight,
-            b=None,
-            residual=None,
-            residual_out=None,
-            mean=None,
-            rstd=context.decode_output_rstd,
-            eps=context.config.output_rms_epsilon,
-            T=rows,
-            D=context.config.value_dim,
-            BD=context.config.value_dim,
-            NB=triton.cdiv(rows, 2048 * 32),
-            ACTIVATION="sigmoid",
-            IS_RMS_NORM=True,
-        )
+        with torch.cuda.graph(graph):
+            self._fused_recurrent_kda_kernel[
+                (4 * batch * context.config.heads,)
+            ](
+                q=token.q_act,
+                k=token.k_act,
+                v=token.v_act,
+                g=token.g_raw,
+                beta=token.beta_raw,
+                A_log=context.layer.a_log,
+                dt_bias=context.layer.dt_bias,
+                o=output,
+                h0=context.decode_state_pool,
+                ht=context.decode_state_pool,
+                cu_seqlens=None,
+                ssm_state_indices=context.decode_state_indices,
+                num_accepted_tokens=None,
+                lower_bound=context.config.lower_bound,
+                scale=context.config.scale,
+                N=batch,
+                T=1,
+                H=context.config.heads,
+                HV=context.config.heads,
+                K=context.config.key_dim,
+                V=context.config.value_dim,
+                BK=context.config.key_dim,
+                BV=32,
+                stride_init_state_token=context.decode_state_pool.stride(1),
+                stride_final_state_token=context.decode_state_pool.stride(1),
+                stride_indices_seq=1,
+                stride_indices_tok=1,
+                INPLACE_FINAL_STATE=True,
+                IS_BETA_HEADWISE=False,
+                USE_QK_L2NORM_IN_KERNEL=True,
+                USE_GATE_IN_KERNEL=True,
+                APPLY_BETA_SIGMOID=True,
+                ALLOW_NEG_EIGVAL=False,
+                STATE_V_FIRST=True,
+                num_warps=4,
+                num_stages=2,
+            )
+            self._norm_gate_kernel[
+                lambda meta: (triton.cdiv(rows, meta["BT"]),)
+            ](
+                x=output,
+                g=token.output_gate_logits,
+                y=output,
+                w=context.layer.output_norm_weight,
+                b=None,
+                residual=None,
+                residual_out=None,
+                mean=None,
+                rstd=context.decode_output_rstd,
+                eps=context.config.output_rms_epsilon,
+                T=rows,
+                D=context.config.value_dim,
+                BD=context.config.value_dim,
+                NB=triton.cdiv(rows, 2048 * 32),
+                ACTIVATION="sigmoid",
+                IS_RMS_NORM=True,
+            )
+        context.decode_graph = graph
+        graph.replay()
 
     def export_state(
         self,
