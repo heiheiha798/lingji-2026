@@ -13,12 +13,20 @@ struct DeviceResources {
   std::uint64_t *reachability = nullptr;
   std::uint64_t *pivot_rows = nullptr;
   std::uint64_t *pivot_masks = nullptr;
+  const std::uint64_t *registered_input = nullptr;
+  std::uint64_t *registered_output = nullptr;
   cudaStream_t stream = nullptr;
 
   ~DeviceResources() {
     cudaFree(pivot_masks);
     cudaFree(pivot_rows);
     cudaFree(reachability);
+    if (registered_output != nullptr) {
+      cudaHostUnregister(registered_output);
+    }
+    if (registered_input != nullptr) {
+      cudaHostUnregister(const_cast<std::uint64_t *>(registered_input));
+    }
     if (stream != nullptr) {
       cudaStreamDestroy(stream);
     }
@@ -63,6 +71,20 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
             d.stream, cudaStreamAttributeAccessPolicyWindow,
             &stream_attribute))) {
       return 2;
+    }
+  }
+  if (bytes >= 128ULL * 1024 * 1024) {
+    if (!CudaOk(cudaHostRegister(const_cast<std::uint64_t *>(adjacency), bytes,
+                                 cudaHostRegisterDefault))) {
+      return 2;
+    }
+    d.registered_input = adjacency;
+    if (reachability != adjacency) {
+      if (!CudaOk(cudaHostRegister(reachability, bytes,
+                                   cudaHostRegisterDefault))) {
+        return 2;
+      }
+      d.registered_output = reachability;
     }
   }
   if (!CudaOk(cudaMemcpyAsync(d.reachability, adjacency, bytes,
