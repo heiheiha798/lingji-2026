@@ -371,11 +371,11 @@ class Submission:
         max_seq_len = int(spec.max_seq_len)
         work_items = batch_size * num_kv_heads
         if max_seq_len >= 16384 and work_items <= 8:
-            num_splits = 16
+            num_splits = 32
         elif max_seq_len >= 16384 and work_items <= 64:
-            num_splits = 4
+            num_splits = 8
         elif max_seq_len >= 16384 and work_items <= 256:
-            num_splits = 2
+            num_splits = 4
         else:
             num_splits = 1
 
