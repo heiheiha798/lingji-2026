@@ -51,11 +51,11 @@ __device__ __forceinline__ bool shared_index_less(
     int32_t lhs_position,
     int32_t rhs_position,
     const int32_t* __restrict__ indices,
-    const uint32_t* __restrict__ keys) {
+    const uint64_t* __restrict__ keys) {
 #pragma unroll
-  for (int32_t word = 0; word < kWidth / 4; ++word) {
-    const uint32_t lhs_word = keys[word * kThreads + lhs_position];
-    const uint32_t rhs_word = keys[word * kThreads + rhs_position];
+  for (int32_t word = 0; word < kWidth / 8; ++word) {
+    const uint64_t lhs_word = keys[word * kThreads + lhs_position];
+    const uint64_t rhs_word = keys[word * kThreads + rhs_position];
     if (lhs_word != rhs_word) {
       return lhs_word < rhs_word;
     }
@@ -180,7 +180,7 @@ __global__ void merge_pass(
   __shared__ int32_t tile[kThreads];
   __shared__ uint32_t tile_prefixes[kCachePrefix ? kThreads : 1];
   __shared__ int32_t block_partitions[2];
-  extern __shared__ uint32_t tile_keys[];
+  extern __shared__ uint64_t tile_keys[];
   static_assert(!(kCachePrefix && kCacheFullKey));
 
   const int32_t lane = static_cast<int32_t>(threadIdx.x);
@@ -236,20 +236,20 @@ __global__ void merge_pass(
       const uint4 second_half =
           *reinterpret_cast<const uint4*>(string + sizeof(uint4));
       tile_keys[0 * kThreads + lane] =
-          __byte_perm(first_half.x, 0, 0x0123);
-      tile_keys[1 * kThreads + lane] =
+          (static_cast<uint64_t>(__byte_perm(first_half.x, 0, 0x0123))
+           << 32) |
           __byte_perm(first_half.y, 0, 0x0123);
-      tile_keys[2 * kThreads + lane] =
-          __byte_perm(first_half.z, 0, 0x0123);
-      tile_keys[3 * kThreads + lane] =
+      tile_keys[1 * kThreads + lane] =
+          (static_cast<uint64_t>(__byte_perm(first_half.z, 0, 0x0123))
+           << 32) |
           __byte_perm(first_half.w, 0, 0x0123);
-      tile_keys[4 * kThreads + lane] =
-          __byte_perm(second_half.x, 0, 0x0123);
-      tile_keys[5 * kThreads + lane] =
+      tile_keys[2 * kThreads + lane] =
+          (static_cast<uint64_t>(__byte_perm(second_half.x, 0, 0x0123))
+           << 32) |
           __byte_perm(second_half.y, 0, 0x0123);
-      tile_keys[6 * kThreads + lane] =
-          __byte_perm(second_half.z, 0, 0x0123);
-      tile_keys[7 * kThreads + lane] =
+      tile_keys[3 * kThreads + lane] =
+          (static_cast<uint64_t>(__byte_perm(second_half.z, 0, 0x0123))
+           << 32) |
           __byte_perm(second_half.w, 0, 0x0123);
     }
   }
@@ -418,7 +418,7 @@ void lexsort_cuda(
       merge_pass<32, false, true><<<
           blocks,
           kThreads,
-          (32 / 4) * kThreads * sizeof(uint32_t),
+          (32 / 8) * kThreads * sizeof(uint64_t),
           capture_stream>>>(
           input_strings, source, destination, n, run_length);
     } else {
