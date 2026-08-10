@@ -375,7 +375,7 @@ class Submission:
         elif max_seq_len >= 16384 and work_items <= 64:
             num_splits = 16
         elif max_seq_len >= 16384 and work_items <= 256:
-            num_splits = 8
+            num_splits = 4
         else:
             num_splits = 1
 
