@@ -173,7 +173,7 @@ def _compile_paged_gqa_split(
         ),
     ):
         with T.Kernel(
-            batch_size, num_kv_heads, num_splits, threads=_THREADS
+            batch_size, num_kv_heads, num_splits, threads=64
         ) as (batch, kv_head, split):
             q_shared = T.alloc_shared((_BLOCK_H, _HEAD_DIM), T.bfloat16)
             k_shared = T.alloc_shared((page_size, _HEAD_DIM), T.bfloat16)
