@@ -71,7 +71,8 @@ def _chunk_state(B, S):
             T.copy(state, state_shared)
 
             for i_t in T.Pipelined((S + BT - 1) // BT, num_stages=1):
-                T.copy(state_shared, h[i_b, i_t, i_h, 0:K, i_v * BV : (i_v + 1) * BV])
+                for j_v, i_k in T.Parallel(BV, K):
+                    h[i_b, i_t, i_h, i_v * BV + j_v, i_k] = state_shared[i_k, j_v]
                 T.copy(w[i_b, i_t * BT : (i_t + 1) * BT, i_h, 0:K], w_shared)
                 T.gemm(w_shared, state_shared, v_new_fragment, clear_accum=True)
 
@@ -114,7 +115,7 @@ def _gdn_fwd(q, k, v, g, beta, scale):
     g = chunk_local_cumsum(g, chunk_size=64, scale=RCP_LN2)
     w, u, A = chunk_gated_delta_rule_fwd_intra(k=k, v=v, g=g, beta=beta)
     h, v_new = _chunk_state(q.shape[0], q.shape[1])(k, w, u, g)
-    o = chunk_fwd_o(q=q, k=k, v=v_new, h=h, g=g, scale=scale, state_v_first=False)
+    o = chunk_fwd_o(q=q, k=k, v=v_new, h=h, g=g, scale=scale, state_v_first=True)
     return g, o, A
 
 
@@ -137,11 +138,11 @@ class _GDNFunction(torch.autograd.Function):
         dv = chunk_bwd_dv_local(q=q, k=k, g=g, do=do, scale=ctx.scale)
         dh, _, dv = chunk_gated_delta_rule_bwd_dhu(
             q=q, k=k, w=w, g=g, h0=None, dht=None, do=do, dv=dv,
-            scale=ctx.scale, state_v_first=False,
+            scale=ctx.scale, state_v_first=True,
         )
         dq, dk, dw, dg = chunk_bwd_dqkwg(
             q=q, k=k, v=v_new, w=w, g=g, h=h, dv=dv, do=do, dh=dh,
-            scale=ctx.scale, state_v_first=False,
+            scale=ctx.scale, state_v_first=True,
         )
         dk2, dv, db, dg2 = prepare_wy_repr_bwd(
             k=k, v=v, beta=beta, g=g, A=A, dw=dw, du=dv,
