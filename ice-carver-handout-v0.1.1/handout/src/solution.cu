@@ -3,7 +3,6 @@
 #include "icecarver/cuda_check.h"
 #include "icecarver/mc_tables.cuh"
 
-#include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_scan.cuh>
 
@@ -17,7 +16,7 @@ namespace {
 constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr int kThreads = 256;
 constexpr int kRowThreads = 64;
-constexpr std::uint32_t kImplementationId = 8;
+constexpr std::uint32_t kImplementationId = 9;
 
 __device__ __constant__ std::int8_t g_triangle_table[256][16];
 __device__ __constant__ std::uint8_t g_triangle_count[256];
@@ -114,6 +113,56 @@ __global__ void classify_cells(const float* __restrict__ volume, int nx,
   }
 }
 
+__global__ void classify_cells_by_row(
+    const float* __restrict__ volume, int nx, int ny, int cx, int cy,
+    std::uint32_t num_cells, const float* __restrict__ isovalues,
+    std::uint8_t* __restrict__ counts,
+    std::uint32_t* __restrict__ row_counts) {
+  __shared__ std::uint32_t warp_totals[2][icecarver::kMaxIsovalues];
+
+  const std::uint32_t row_id = blockIdx.x;
+  const int y = static_cast<int>(row_id % static_cast<std::uint32_t>(cy));
+  const int z = static_cast<int>(row_id / static_cast<std::uint32_t>(cy));
+  std::uint32_t thread_totals[icecarver::kMaxIsovalues]{};
+  for (int x = threadIdx.x; x < cx; x += blockDim.x) {
+    const std::uint32_t cell_id = row_id * static_cast<std::uint32_t>(cx) +
+                                  static_cast<std::uint32_t>(x);
+    float values[8];
+    icecarver::mc::load_corners(volume, nx, ny, x, y, z, values);
+#pragma unroll
+    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+      const std::uint8_t cube_case =
+          icecarver::mc::case_index(values, isovalues[iso]);
+      const std::uint8_t count = g_triangle_count[cube_case];
+      counts[static_cast<std::size_t>(iso) * num_cells + cell_id] = count;
+      thread_totals[iso] += count;
+    }
+  }
+
+#pragma unroll
+  for (int delta = 16; delta > 0; delta >>= 1) {
+#pragma unroll
+    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+      thread_totals[iso] +=
+          __shfl_down_sync(0xffffffffU, thread_totals[iso], delta);
+    }
+  }
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) {
+#pragma unroll
+    for (int iso = 0; iso < icecarver::kMaxIsovalues; ++iso) {
+      warp_totals[warp][iso] = thread_totals[iso];
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x < icecarver::kMaxIsovalues) {
+    const int iso = threadIdx.x;
+    row_counts[static_cast<std::size_t>(iso) * gridDim.x + row_id] =
+        warp_totals[0][iso] + warp_totals[1][iso];
+  }
+}
+
 __global__ void publish_total(const std::uint8_t* __restrict__ counts,
                               const std::uint32_t* __restrict__ offsets,
                               std::uint32_t num_cells,
@@ -121,25 +170,6 @@ __global__ void publish_total(const std::uint8_t* __restrict__ counts,
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     const std::uint32_t last = num_cells - 1;
     totals[iso] = static_cast<std::uint64_t>(offsets[last]) + counts[last];
-  }
-}
-
-__global__ void sum_triangle_counts_by_row(
-    const std::uint8_t* __restrict__ counts, int cx,
-    std::uint32_t* __restrict__ row_counts) {
-  using BlockReduce = cub::BlockReduce<std::uint32_t, kRowThreads>;
-  __shared__ typename BlockReduce::TempStorage reduce_storage;
-
-  const std::uint32_t row_id = blockIdx.x;
-  std::uint32_t thread_total = 0;
-  for (int x = threadIdx.x; x < cx; x += blockDim.x) {
-    thread_total += counts[row_id * static_cast<std::uint32_t>(cx) +
-                           static_cast<std::uint32_t>(x)];
-  }
-  const std::uint32_t row_total =
-      BlockReduce(reduce_storage).Sum(thread_total);
-  if (threadIdx.x == 0) {
-    row_counts[row_id] = row_total;
   }
 }
 
@@ -282,8 +312,10 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   std::size_t offsets_bytes = 0;
   std::size_t offset_entries = static_cast<std::size_t>(num_cells);
   if (input->num_isovalues == icecarver::kMaxIsovalues &&
-      2U * static_cast<std::size_t>(rows) > offset_entries) {
-    offset_entries = 2U * static_cast<std::size_t>(rows);
+      static_cast<std::size_t>(icecarver::kMaxIsovalues + 1) * rows >
+          offset_entries) {
+    offset_entries =
+        static_cast<std::size_t>(icecarver::kMaxIsovalues + 1) * rows;
   }
   if (!checked_multiply(static_cast<std::size_t>(num_cells),
                         static_cast<std::size_t>(input->num_isovalues),
@@ -358,9 +390,15 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
   const unsigned int blocks =
       (num_cells + static_cast<std::uint32_t>(kThreads) - 1U) /
       static_cast<std::uint32_t>(kThreads);
-  classify_cells<<<blocks, kThreads, 0, stream>>>(
-      input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
-      num_cells, input->isovalues, input->num_isovalues, counts);
+  if (input->num_isovalues == icecarver::kMaxIsovalues) {
+    classify_cells_by_row<<<rows, kRowThreads, 0, stream>>>(
+        input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
+        num_cells, input->isovalues, counts, offsets);
+  } else {
+    classify_cells<<<blocks, kThreads, 0, stream>>>(
+        input->volume, input->nx, input->ny, input->nx - 1, input->ny - 1,
+        num_cells, input->isovalues, input->num_isovalues, counts);
+  }
   ICECARVER_RETURN_IF_LAUNCH_ERROR();
 
   for (int iso = 0; iso < input->num_isovalues; ++iso) {
@@ -368,11 +406,9 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
         counts + static_cast<std::size_t>(iso) * num_cells;
 
     if (input->num_isovalues == icecarver::kMaxIsovalues) {
-      auto* row_counts = offsets;
-      auto* row_offsets = offsets + rows;
-      sum_triangle_counts_by_row<<<rows, kRowThreads, 0, stream>>>(
-          iso_counts, input->nx - 1, row_counts);
-      ICECARVER_RETURN_IF_LAUNCH_ERROR();
+      auto* row_counts = offsets + static_cast<std::size_t>(iso) * rows;
+      auto* row_offsets =
+          offsets + static_cast<std::size_t>(icecarver::kMaxIsovalues) * rows;
       ICECARVER_RETURN_IF_CUDA_ERROR(cub::DeviceScan::ExclusiveSum(
           scan_temp, scan_temp_bytes, row_counts, row_offsets,
           static_cast<int>(rows), stream));
