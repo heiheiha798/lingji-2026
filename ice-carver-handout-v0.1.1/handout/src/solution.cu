@@ -14,7 +14,8 @@ namespace {
 
 constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr int kThreads = 256;
-constexpr std::uint32_t kImplementationId = 5;
+constexpr int kRowThreads = 128;
+constexpr std::uint32_t kImplementationId = 6;
 
 __device__ __constant__ std::int8_t g_triangle_table[256][16];
 __device__ __constant__ std::uint8_t g_triangle_count[256];
@@ -310,7 +311,7 @@ extern "C" int icecarver_solve(const icecarver::Input* input,
 
     if (input->emit_triangles != 0) {
       if (input->num_isovalues == icecarver::kMaxIsovalues) {
-        generate_triangles_by_row<<<rows, kThreads, 0, stream>>>(
+        generate_triangles_by_row<<<rows, kRowThreads, 0, stream>>>(
             input->volume, input->nx, input->ny, input->nx - 1,
             input->ny - 1, input->isovalues, iso, iso_counts, offsets,
             output->triangle_counts, output->triangles[iso],
