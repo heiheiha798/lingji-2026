@@ -69,3 +69,19 @@ TileLang 的 16x16 MMA 布局无法把该 kernel 映射到 4 warps，编译期�
 `m_warp * n_warp != num_warps` 拒绝。结合此前多轮 chunk/state/transform/output
 结构优化，以及当前实现已在四个 shape 全部超过可运行的 FLA 0.5.2 基线，继续
 优化需要改写 inter-chunk 算法，当前版本在此停止。
+
+## 收尾静态审查
+
+收尾审查发现 K1 的固定数据只有 64 个实际 chunk，而通用上界为 95，后者会令
+workspace 分成两轮。没有保留仅按 `(T=4096, B=32, H=16)` 假设每条序列长度
+均为 128 的候选：题目声明域允许 `T/B/H` 范围内任意严格递增的运行时 GPU
+`cu_seqlens`，所以相同静态 shape 不能唯一确定长度分布。为固定性能点牺牲该
+输入合同不是合法优化。
+
+另实现并撤销了一个保持任意 varlen 正确性的候选：当 `B>=16` 时，只让 state
+scan CTA 的 thread 0 计算该 sequence/round 的 chunk prefix，再通过 shared memory
+广播给其余线程。构造的 `B=32, H=16, lengths=1..32` 用例中，`out` 和
+`final_state` 均完全通过，NRMSE 分别为 0.004224 和 0.004152。但同一 GPU 6、
+NUMA 1、official cold-L2/4-buffer/4-seed 口径下，K1 从 694.860 us 回退到
+699.517 us（0.67%）；thread-0 串行段和额外 CTA barrier 大于删除重复短扫描的
+收益。候选已完全撤销，最终源码保持不变。
