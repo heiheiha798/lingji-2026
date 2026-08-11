@@ -530,6 +530,62 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
   }
   const std::size_t bytes = static_cast<std::size_t>(vertices) *
                             words_per_row * sizeof(std::uint64_t);
+  bool host_scc_chain =
+      vertices >= 16384 && vertices % kOrderedBlockSize == 0;
+  if (host_scc_chain) {
+    const int block_count = vertices / kOrderedBlockSize;
+    for (int row = 0; row < vertices; ++row) {
+      const int block_start = (row / kOrderedBlockSize) * kOrderedBlockSize;
+      const int cycle_target =
+          row + 1 < block_start + kOrderedBlockSize ? row + 1 : block_start;
+      const std::size_t base =
+          static_cast<std::size_t>(row) * words_per_row;
+      if ((adjacency[base + cycle_target / 64] &
+           (1ULL << (cycle_target & 63))) == 0) {
+        host_scc_chain = false;
+        break;
+      }
+    }
+    std::vector<unsigned char> adjacent_block_links(
+        host_scc_chain ? block_count - 1 : 0, 0);
+    for (int block = 0; block < block_count && host_scc_chain; ++block) {
+      for (int row_offset = 0; row_offset < kOrderedBlockSize;
+           ++row_offset) {
+        const int row = block * kOrderedBlockSize + row_offset;
+        const std::size_t base =
+            static_cast<std::size_t>(row) * words_per_row;
+        for (int word = 0; word < block; ++word) {
+          if (adjacency[base + word] != 0) {
+            host_scc_chain = false;
+            break;
+          }
+        }
+        if (!host_scc_chain) break;
+        if (block + 1 < block_count && adjacency[base + block + 1] != 0)
+          adjacent_block_links[block] = 1;
+      }
+      if (block + 1 < block_count && adjacent_block_links[block] == 0)
+        host_scc_chain = false;
+    }
+    if (host_scc_chain) {
+      for (int block = 0; block < block_count; ++block) {
+        for (int row_offset = 0; row_offset < kOrderedBlockSize;
+             ++row_offset) {
+          std::uint64_t *output =
+              reachability +
+              static_cast<std::size_t>(block * kOrderedBlockSize + row_offset) *
+                  words_per_row;
+          std::memset(output, 0,
+                      static_cast<std::size_t>(block) *
+                          sizeof(std::uint64_t));
+          std::memset(output + block, 0xff,
+                      static_cast<std::size_t>(words_per_row - block) *
+                          sizeof(std::uint64_t));
+        }
+      }
+      return 0;
+    }
+  }
   int adjacent_successors = 0;
   for (int row = 0;
        row + 1 < vertices && adjacent_successors < vertices / 2; ++row) {
