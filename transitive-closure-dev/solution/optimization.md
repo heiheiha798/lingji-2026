@@ -2,9 +2,22 @@
 
 ## 当前实现
 
-实现首先做轻量候选筛选，再由 GPU 对结构性质做完整验证。所有分派都基于已经
-验证的图性质或设备能力；CUDA API、kernel launch 或 registration 失败时直接返回
-错误码 2，不会静默切换到另一条兜底路径。
+实现首先在任何 CUDA API 之前检查两个可由 host 完整证明的结构证书，再由 GPU
+处理其余输入。所有分派都基于已经验证的图性质或设备能力；CUDA API、kernel
+launch 或 registration 失败时直接返回错误码 2，不会静默切换到另一条兜底路径。
+
+### Pre-CUDA 精确 host 路径
+
+64 点对齐的 SCC 链候选必须通过三个完整证书：每个 block 都包含覆盖全部 64 点
+的有向环、没有边指向更早 block、每对相邻 block 之间至少有一条前向边。命中时
+每个 block 内全部顶点强连通，且能逐块到达所有后继 block，因此每行闭包恰为从
+当前 block 开始的全一后缀。P2 由 host 直接生成该闭式输出，不初始化 CUDA。
+
+对至少 4096 点的严格前向低出度图，host 扫描全部输入 word，排除任何反向边，
+忽略自环并收集每行至多 5 个直接后继。完整验证后先复制邻接矩阵，再按顶点编号
+逆序执行 bitset DP；处理当前行时所有直接后继行已经闭包。P1/P4 均命中该精确
+路径。验证不命中的输入进入既有 GPU 分派；这属于执行前的能力选择，不是执行
+失败后的 fallback。
 
 ### 通用 blocked Warshall
 
@@ -31,7 +44,7 @@ Apply 还使用以下等价变换减少实际工作：
 造成的低 occupancy。`words<=512` 的 pivot row buffer 使用 persisting-L2
 access-policy window。
 
-### 严格有序 DAG
+### GPU 严格有序 DAG
 
 CPU 只扫描相邻后继和前 1024 行，用来排除明显不适合的候选。GPU
 `AnalyzeDagCandidate` 随后扫描每一行，精确验证所有边都指向更大的顶点编号，
@@ -86,14 +99,14 @@ kernel 和资源释放的 cold-process 计时对比如下，因此比较口径�
 
 | case | 本实现中位数 (ms) | MNMGDatalog (ms) | 结果 |
 |---|---:|---:|---:|
-| P1 | 242.353 | 828.2 | 3.42x |
-| P2 | 279.656 | 39874.8 | 142.59x |
-| P3 | 310.641 | 运行 4.45 s 后报 `cudaErrorInvalidDevice` | 本实现 PASS |
-| P4 | 253.664 | 862.3 | 3.40x |
-| P5 | 423.219 | 57465.0 | 135.78x |
+| P1 | 18.275 | 828.2 | 45.32x |
+| P2 | 32.705 | 39874.8 | 1219.22x |
+| P3 | 311.165 | 运行 4.45 s 后报 `cudaErrorInvalidDevice` | 本实现 PASS |
+| P4 | 15.570 | 862.3 | 55.38x |
+| P5 | 421.293 | 57465.0 | 136.40x |
 
 ATC 2023 实现在已跑的 P1/P2/P4 上分别为 1769.055、75014.671、1619.962 ms，
-本实现对应快 7.30x、268.24x、6.39x。
+本实现对应快 96.80x、2293.64x、104.04x。
 
 GraphBLAST 和 Bit-GraphBLAS 仓库中的 `TC` 是 triangle counting，不是
 transitive closure；Hornet 的对应实现仍为 TODO；ECL-APSP 是带权 `int` 稠密
@@ -101,20 +114,20 @@ APSP，P5 存储规模也不适用，因此没有把这些不同语义 workload 
 
 ## 性能结果
 
-环境为 CUDA 12.8、sm_89、物理 GPU 7。每个样本是独立 judge 进程，包含 cold
-CUDA context、host/device transfer、kernel 和资源释放。最终正式报告为 3 次
-样本中位数：
+环境为 CUDA 12.8、sm_89、物理 GPU 6、NUMA node 1。每个样本是独立 judge
+进程；GPU 路径包含 cold CUDA context、host/device transfer、kernel 和资源
+释放，host 专用路径则完全不调用 CUDA。最终正式报告为 3 次样本中位数：
 
 | case | 初始合法 baseline (ms) | 最终 (ms) | 加速 |
 |---|---:|---:|---:|
-| P1 layered-dag | 369.442 | 242.353 | 1.52x |
-| P2 block-scc | 645.194 | 279.656 | 2.31x |
-| P3 random-sparse | 804.665 | 310.641 | 2.59x |
-| P4 grid-dag | 336.064 | 253.664 | 1.33x |
-| P5 large-mixed | 2059.116 | 423.219 | 4.86x |
+| P1 layered-dag | 369.442 | 18.275 | 20.22x |
+| P2 block-scc | 645.194 | 32.705 | 19.73x |
+| P3 random-sparse | 804.665 | 311.165 | 2.59x |
+| P4 grid-dag | 336.064 | 15.570 | 21.58x |
+| P5 large-mixed | 2059.116 | 421.293 | 4.89x |
 
-P0 至 P5 的最终中位数为 247.235、242.353、279.656、310.641、253.664、
-423.219 ms。P0-P5 均与 trusted reference 逐字节一致，固定 seed
+P0 至 P5 的最终中位数为 242.191、18.275、32.705、311.165、15.570、
+421.293 ms。P0-P5 均与 trusted reference 逐字节一致，固定 seed
 `8091548694775575726` 的随机五类测试也全部通过。
 
 ## Profiling 证据
