@@ -586,6 +586,76 @@ extern "C" int closure_run(const std::uint64_t *adjacency,
       return 0;
     }
   }
+  bool host_low_degree_dag = vertices >= 4096;
+  if (host_low_degree_dag) {
+    std::vector<unsigned char> successor_counts(vertices, 0);
+    std::vector<int> successors(static_cast<std::size_t>(vertices) * 5);
+    for (int row = 0; row < vertices && host_low_degree_dag; ++row) {
+      const std::size_t base =
+          static_cast<std::size_t>(row) * words_per_row;
+      const int diagonal_word = row / 64;
+      const int diagonal_bit = row & 63;
+      int successor_count = 0;
+      for (int word = 0; word < words_per_row; ++word) {
+        std::uint64_t remaining = adjacency[base + word];
+        if (word < diagonal_word) {
+          if (remaining != 0) {
+            host_low_degree_dag = false;
+            break;
+          }
+          continue;
+        }
+        if (word == diagonal_word) {
+          if (diagonal_bit != 0 &&
+              (remaining & ((1ULL << diagonal_bit) - 1ULL)) != 0) {
+            host_low_degree_dag = false;
+            break;
+          }
+          remaining = diagonal_bit == 63
+                          ? 0
+                          : remaining &
+                                ~((1ULL << (diagonal_bit + 1)) - 1ULL);
+        }
+        if (word == words_per_row - 1 && (vertices & 63) != 0)
+          remaining &= (1ULL << (vertices & 63)) - 1ULL;
+        while (remaining != 0) {
+          if (successor_count == 5) {
+            host_low_degree_dag = false;
+            break;
+          }
+          const int bit = __builtin_ctzll(remaining);
+          successors[static_cast<std::size_t>(row) * 5 + successor_count] =
+              word * 64 + bit;
+          ++successor_count;
+          remaining &= remaining - 1;
+        }
+        if (!host_low_degree_dag) break;
+      }
+      successor_counts[row] = static_cast<unsigned char>(successor_count);
+    }
+    if (host_low_degree_dag) {
+      if (reachability != adjacency)
+        std::memcpy(reachability, adjacency, bytes);
+      for (int row = vertices - 1; row >= 0; --row) {
+        const std::size_t base =
+            static_cast<std::size_t>(row) * words_per_row;
+        reachability[base + row / 64] |= 1ULL << (row & 63);
+        for (int index = 0; index < successor_counts[row]; ++index) {
+          const int successor =
+              successors[static_cast<std::size_t>(row) * 5 + index];
+          const std::size_t successor_base =
+              static_cast<std::size_t>(successor) * words_per_row;
+          for (int word = successor / 64; word < words_per_row; ++word)
+            reachability[base + word] |=
+                reachability[successor_base + word];
+        }
+        if ((vertices & 63) != 0)
+          reachability[base + words_per_row - 1] &=
+              (1ULL << (vertices & 63)) - 1ULL;
+      }
+      return 0;
+    }
+  }
   int adjacent_successors = 0;
   for (int row = 0;
        row + 1 < vertices && adjacent_successors < vertices / 2; ++row) {
