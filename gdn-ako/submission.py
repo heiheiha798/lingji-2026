@@ -27,7 +27,7 @@ from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu
 from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
-from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
+from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 
@@ -116,7 +116,7 @@ def _gdn_fwd(q, k, v, g, beta, scale):
     w, u, A = chunk_gated_delta_rule_fwd_intra(k=k, v=v, g=g, beta=beta)
     h, v_new = _chunk_state(q.shape[0], q.shape[1])(k, w, u, g)
     o = chunk_fwd_o(q=q, k=k, v=v_new, h=h, g=g, scale=scale, state_v_first=True)
-    return g, o, A
+    return g, o, A, w, h, v_new
 
 
 class _GDNFunction(torch.autograd.Function):
@@ -125,16 +125,16 @@ class _GDNFunction(torch.autograd.Function):
     def forward(ctx, q, k, v, g, beta, scale):
         q, q_rstd = l2norm_fwd(q)
         k, k_rstd = l2norm_fwd(k)
-        g, o, A = _gdn_fwd(q, k, v, g, beta, scale)
-        ctx.save_for_backward(q, q_rstd, k, k_rstd, v, g, beta, A)
+        g, o, A, w, h, v_new = _gdn_fwd(q, k, v, g, beta, scale)
+        ctx.save_for_backward(
+            q, q_rstd, k, k_rstd, v, g, beta, A, w, h, v_new
+        )
         ctx.scale = scale
         return o.to(q.dtype)
 
     @staticmethod
     def backward(ctx, do):
-        q, q_rstd, k, k_rstd, v, g, beta, A = ctx.saved_tensors
-        w, u = recompute_w_u_fwd(k=k, v=v, beta=beta, A=A, g=g)
-        h, v_new = _chunk_state(q.shape[0], q.shape[1])(k, w, u, g)
+        q, q_rstd, k, k_rstd, v, g, beta, A, w, h, v_new = ctx.saved_tensors
         dv = chunk_bwd_dv_local(q=q, k=k, g=g, do=do, scale=ctx.scale)
         dh, _, dv = chunk_gated_delta_rule_bwd_dhu(
             q=q, k=k, w=w, g=g, h0=None, dht=None, do=do, dv=dv,
@@ -161,5 +161,5 @@ def gdn_chunk_scan(q, k, v, g, beta, scale):
 
     q_norm, _ = l2norm_fwd(q)
     k_norm, _ = l2norm_fwd(k)
-    _, o, _ = _gdn_fwd(q_norm, k_norm, v, g, beta, scale)
+    _, o, _, _, _, _ = _gdn_fwd(q_norm, k_norm, v, g, beta, scale)
     return o.to(q.dtype)
