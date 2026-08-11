@@ -166,7 +166,7 @@ def _compile_paged_gqa_split(
         BlockTable: T.Tensor((batch_size, max_pages), T.int32),
         SeqLens: T.Tensor((batch_size,), T.int32),
         PartialOutput: T.Tensor(
-            (batch_size, num_q_heads, num_splits, _HEAD_DIM), T.float32
+            (batch_size, num_q_heads, num_splits, _HEAD_DIM), T.bfloat16
         ),
         LogSumExp: T.Tensor(
             (batch_size, num_q_heads, num_splits), T.float32
@@ -303,7 +303,7 @@ def _compile_split_combine(
     @T.prim_func
     def kernel(
         PartialOutput: T.Tensor(
-            (batch_size, num_q_heads, num_splits, _HEAD_DIM), T.float32
+            (batch_size, num_q_heads, num_splits, _HEAD_DIM), T.bfloat16
         ),
         LogSumExp: T.Tensor(
             (batch_size, num_q_heads, num_splits), T.float32
@@ -399,9 +399,8 @@ class Submission:
         )
         max_pages = (max_seq_len + page_size - 1) // page_size
         pages_per_split = (max_pages + num_splits - 1) // num_splits
-        required_bytes = 4 * (
-            partial_elements + batch_size * num_q_heads * num_splits
-        )
+        lse_elements = batch_size * num_q_heads * num_splits
+        required_bytes = 2 * partial_elements + 4 * lse_elements
         if required_bytes > int(spec.workspace_bytes):
             raise ValueError("workspace is too small for split-KV reduction")
         return (
@@ -444,14 +443,14 @@ class Submission:
             attention(q, k_cache, v_cache, block_table, seq_lens, out)
             return
 
-        workspace_float = workspace.view(torch.float32)
-        partial_output = workspace_float[:partial_elements].view(
+        partial_bytes = 2 * partial_elements
+        partial_output = workspace[:partial_bytes].view(torch.bfloat16).view(
             q.shape[0], q.shape[1], num_splits, _HEAD_DIM
         )
-        log_sum_exp = workspace_float[
-            partial_elements : partial_elements
-            + q.shape[0] * q.shape[1] * num_splits
-        ].view(q.shape[0], q.shape[1], num_splits)
+        lse_elements = q.shape[0] * q.shape[1] * num_splits
+        log_sum_exp = workspace[
+            partial_bytes : partial_bytes + 4 * lse_elements
+        ].view(torch.float32).view(q.shape[0], q.shape[1], num_splits)
         attention(
             q,
             k_cache,
